@@ -72,13 +72,14 @@ impl ClientRenderState {
                     "prepare_frame.graphics.bytes",
                     frame.graphics.len() as u64,
                 );
+                let bytes = std::mem::take(&mut encoded.bytes);
                 Some(PreparedRender {
                     message: ServerMessage::Terminal(TerminalFrame {
                         seq: *seq + 1,
                         width: frame.width,
                         height: frame.height,
                         full: encoded.full,
-                        bytes: encoded.bytes.clone(),
+                        bytes,
                     }),
                     encoded: Some(encoded),
                 })

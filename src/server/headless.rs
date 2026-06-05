@@ -196,6 +196,8 @@ pub struct HeadlessServer {
     server_event_rx: mpsc::Receiver<ServerEvent>,
     /// Sender for server events (cloned for each client thread).
     server_event_tx: mpsc::Sender<ServerEvent>,
+    /// First non-scroll server event encountered while coalescing a scroll burst.
+    pending_server_event: Option<ServerEvent>,
 }
 
 fn apply_terminal_attach_scroll(
@@ -325,6 +327,7 @@ impl HeadlessServer {
             should_quit,
             server_event_rx,
             server_event_tx,
+            pending_server_event: None,
         })
     }
 
@@ -396,7 +399,10 @@ impl HeadlessServer {
             // 4. Accept new client connections.
             self.accept_client_connections()?;
 
-            // 5. Drain server events from client threads.
+            // 5. Process at most one generic server event from client threads.
+            // Scroll bursts are coalesced inside the scroll handler; other event
+            // kinds are not drained ahead of rendering, preserving lifecycle and
+            // writer-drain ordering.
             if self.drain_server_events() {
                 needs_render = true;
                 needs_full_render = true;
@@ -544,7 +550,9 @@ impl HeadlessServer {
                 )
                 .map(|deadline| deadline.min(now + CLIENT_ACCEPT_POLL_INTERVAL))
                 .or(Some(now + CLIENT_ACCEPT_POLL_INTERVAL));
-            let event = {
+            let event = if let Some(ev) = self.pending_server_event.take() {
+                LoopEvent::ServerEvent(ev)
+            } else {
                 tokio::select! {
                     maybe_api = self.app.api_rx.recv() => match maybe_api {
                         Some(msg) => LoopEvent::Api(msg),
@@ -1179,15 +1187,23 @@ impl HeadlessServer {
         )
     }
 
-    /// Drains server events from the dedicated channel.
+    /// Processes one pending server event from the dedicated channel.
     ///
-    /// Returns true if any input was processed (requiring a re-render).
+    /// Fast scroll bursts are coalesced by the scroll handler itself. Other
+    /// server events intentionally stay one-at-a-time so lifecycle, resize,
+    /// attach/detach, writer-drain, and shutdown ordering cannot be widened by
+    /// a generic pre-render drain.
     fn drain_server_events(&mut self) -> bool {
-        let mut changed = false;
-        while let Ok(ev) = self.server_event_rx.try_recv() {
-            changed |= self.handle_server_event(ev);
-        }
-        changed
+        let Some(ev) = self.try_recv_server_event() else {
+            return false;
+        };
+        self.handle_server_event(ev)
+    }
+
+    fn try_recv_server_event(&mut self) -> Option<ServerEvent> {
+        self.pending_server_event
+            .take()
+            .or_else(|| self.server_event_rx.try_recv().ok())
     }
 
     fn terminal_id_by_string(&self, terminal_id: &str) -> Option<crate::terminal::TerminalId> {
@@ -1277,6 +1293,40 @@ impl HeadlessServer {
             warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach scroll failed");
         }
         true
+    }
+
+    /// Coalesces only immediately queued terminal-attach scroll events.
+    ///
+    /// The first non-scroll event is saved and processed by the normal event
+    /// path on the next loop turn. This gives wheel bursts one render decision
+    /// without using a generic pre-render drain or reordering lifecycle/resize/
+    /// attach/detach/shutdown/writer-drain events.
+    fn coalesce_pending_terminal_attach_scrolls(&mut self) -> usize {
+        let mut coalesced = 0;
+        while let Ok(ev) = self.server_event_rx.try_recv() {
+            match ev {
+                ServerEvent::ClientAttachScroll {
+                    client_id,
+                    source,
+                    direction,
+                    lines,
+                    column,
+                    row,
+                    modifiers,
+                } => {
+                    if self.handle_terminal_attach_scroll(
+                        client_id, source, direction, lines, column, row, modifiers,
+                    ) {
+                        coalesced += 1;
+                    }
+                }
+                other => {
+                    self.pending_server_event = Some(other);
+                    break;
+                }
+            }
+        }
+        coalesced
     }
 
     fn pane_effective_state(&self, pane_id: crate::layout::PaneId) -> crate::detect::AgentState {
@@ -1887,9 +1937,19 @@ impl HeadlessServer {
                 column,
                 row,
                 modifiers,
-            } => self.handle_terminal_attach_scroll(
-                client_id, source, direction, lines, column, row, modifiers,
-            ),
+            } => {
+                let changed = self.handle_terminal_attach_scroll(
+                    client_id, source, direction, lines, column, row, modifiers,
+                );
+                let coalesced = self.coalesce_pending_terminal_attach_scrolls();
+                if coalesced > 0 {
+                    crate::render_prof::counter(
+                        "server.attach_scroll_events_coalesced",
+                        coalesced as u64,
+                    );
+                }
+                changed || coalesced > 0
+            }
             ServerEvent::ClientInput { client_id, data } => {
                 if self.handoff_in_progress {
                     debug!(
@@ -3390,6 +3450,7 @@ mod tests {
             should_quit: Arc::new(AtomicBool::new(false)),
             server_event_rx,
             server_event_tx,
+            pending_server_event: None,
         }
     }
 
@@ -4026,6 +4087,179 @@ next_tab = ""
         let metrics = runtime.scroll_metrics().expect("scroll metrics");
         assert_eq!(metrics.offset_from_bottom, 1);
         drop(runtime);
+        drop(_runtime_guard);
+        rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    fn terminal_attach_scroll_server() -> (HeadlessServer, String) {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("scroll");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace
+            .pane_state(pane_id)
+            .expect("pane")
+            .attached_terminal_id
+            .clone();
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.ensure_test_terminals();
+
+        let mut bytes = Vec::new();
+        for line in 0..160 {
+            bytes.extend_from_slice(format!("line {line:03}\r\n").as_bytes());
+        }
+        let runtime =
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(20, 5, 4096, &bytes);
+        server
+            .app
+            .terminal_runtimes
+            .insert(terminal_id.clone(), runtime);
+        let terminal_id = terminal_id.to_string();
+        let (writer, _control_rx, _render_rx) = test_client_writer();
+
+        assert!(server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 7,
+            cols: 20,
+            rows: 5,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            render_encoding: RenderEncoding::TerminalAnsi,
+            keybindings: None,
+            direct_attach_requested: true,
+            writer,
+        }));
+        assert!(
+            server.handle_server_event(ServerEvent::ClientAttachTerminal {
+                client_id: 7,
+                terminal_id: terminal_id.clone(),
+                takeover: false,
+            })
+        );
+
+        (server, terminal_id)
+    }
+
+    #[test]
+    fn terminal_attach_scroll_burst_sets_one_render_decision_for_many_events() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _runtime_guard = rt.enter();
+        let (mut server, terminal_id) = terminal_attach_scroll_server();
+
+        for _ in 0..64 {
+            server
+                .server_event_tx
+                .try_send(ServerEvent::ClientAttachScroll {
+                    client_id: 7,
+                    source: AttachScrollSource::Wheel,
+                    direction: AttachScrollDirection::Up,
+                    lines: 1,
+                    column: None,
+                    row: None,
+                    modifiers: 0,
+                })
+                .expect("queue scroll burst");
+        }
+
+        let mut render_decisions = 0;
+        if server.drain_server_events() {
+            render_decisions += 1;
+        }
+        while server.drain_server_events() {
+            render_decisions += 1;
+        }
+
+        assert_eq!(
+            render_decisions, 1,
+            "scroll burst must not render per event"
+        );
+        let metrics = server
+            .runtime_for_terminal_id_string(&terminal_id)
+            .expect("attached runtime")
+            .scroll_metrics()
+            .expect("scroll metrics");
+        assert_eq!(metrics.offset_from_bottom, 64);
+
+        drop(_runtime_guard);
+        rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn terminal_attach_scroll_coalescing_stops_before_non_scroll_event() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _runtime_guard = rt.enter();
+        let (mut server, terminal_id) = terminal_attach_scroll_server();
+
+        server
+            .server_event_tx
+            .try_send(ServerEvent::ClientAttachScroll {
+                client_id: 7,
+                source: AttachScrollSource::Wheel,
+                direction: AttachScrollDirection::Up,
+                lines: 1,
+                column: None,
+                row: None,
+                modifiers: 0,
+            })
+            .expect("queue first scroll");
+        server
+            .server_event_tx
+            .try_send(ServerEvent::ClientResize {
+                client_id: 7,
+                cols: 30,
+                rows: 6,
+                cell_width_px: 10,
+                cell_height_px: 20,
+            })
+            .expect("queue resize boundary");
+        server
+            .server_event_tx
+            .try_send(ServerEvent::ClientAttachScroll {
+                client_id: 7,
+                source: AttachScrollSource::Wheel,
+                direction: AttachScrollDirection::Up,
+                lines: 1,
+                column: None,
+                row: None,
+                modifiers: 0,
+            })
+            .expect("queue second scroll");
+
+        assert!(server.drain_server_events());
+        assert_eq!(
+            server
+                .runtime_for_terminal_id_string(&terminal_id)
+                .expect("attached runtime")
+                .scroll_metrics()
+                .expect("scroll metrics")
+                .offset_from_bottom,
+            1,
+            "coalescing must not cross a non-scroll boundary"
+        );
+
+        assert!(server.drain_server_events());
+        assert_eq!(
+            server.clients.get(&7).expect("client").terminal_size,
+            (30, 6),
+            "resize must be processed before the later scroll"
+        );
+
+        assert!(server.drain_server_events());
+        assert_eq!(
+            server
+                .runtime_for_terminal_id_string(&terminal_id)
+                .expect("attached runtime")
+                .scroll_metrics()
+                .expect("scroll metrics")
+                .offset_from_bottom,
+            2
+        );
+
         drop(_runtime_guard);
         rt.shutdown_timeout(Duration::from_millis(100));
     }

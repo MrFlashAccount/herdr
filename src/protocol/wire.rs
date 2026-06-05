@@ -236,6 +236,32 @@ impl FrameData {
         let width = area.width;
         let height = area.height;
 
+        if hyperlinks.is_empty() {
+            let mut cells = Vec::with_capacity((width as usize) * (height as usize));
+            for row in 0..height {
+                for col in 0..width {
+                    let cell = buffer.cell((col, row)).expect("cell within bounds");
+                    cells.push(CellData {
+                        symbol: cell.symbol().to_owned(),
+                        fg: color_to_u32(cell.fg),
+                        bg: color_to_u32(cell.bg),
+                        modifier: modifier_to_u16(cell.modifier),
+                        skip: cell.skip,
+                        hyperlink: None,
+                    });
+                }
+            }
+
+            return FrameData {
+                cells,
+                width,
+                height,
+                cursor,
+                hyperlinks: Vec::new(),
+                graphics: Vec::new(),
+            };
+        }
+
         let mut hyperlink_uris = Vec::<String>::new();
         let mut hyperlink_indices = HashMap::<&str, u32>::new();
         let mut hyperlink_by_position = HashMap::<(u16, u16), (&str, &str)>::new();
