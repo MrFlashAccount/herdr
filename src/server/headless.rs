@@ -242,8 +242,13 @@ fn apply_terminal_attach_scroll(
                     "failed to encode terminal attach mouse wheel event: {wheel_kind:?}"
                 ));
             };
+            let event_count = usize::from(lines.max(1));
+            let mut repeated = Vec::with_capacity(bytes.len().saturating_mul(event_count));
+            for _ in 0..event_count {
+                repeated.extend_from_slice(&bytes);
+            }
             runtime
-                .try_send_bytes(Bytes::from(bytes))
+                .try_send_bytes(Bytes::from(repeated))
                 .map_err(|err| format!("terminal attach mouse wheel input failed: {err}"))?;
         }
         Some(crate::pane::WheelRouting::AlternateScroll) => {
@@ -251,8 +256,13 @@ fn apply_terminal_attach_scroll(
             let Some(bytes) = runtime.encode_alternate_scroll(wheel_kind) else {
                 return Ok(());
             };
+            let event_count = usize::from(lines.max(1));
+            let mut repeated = Vec::with_capacity(bytes.len().saturating_mul(event_count));
+            for _ in 0..event_count {
+                repeated.extend_from_slice(&bytes);
+            }
             runtime
-                .try_send_bytes(Bytes::from(bytes))
+                .try_send_bytes(Bytes::from(repeated))
                 .map_err(|err| format!("terminal attach alternate scroll input failed: {err}"))?;
         }
         Some(crate::pane::WheelRouting::HostScroll) | None => match direction {
@@ -4390,6 +4400,97 @@ next_tab = ""
             input_rx.try_recv().expect("forwarded page key"),
             Bytes::from_static(b"\x1b[5~")
         );
+        drop(runtime);
+        drop(_runtime_guard);
+        rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn terminal_attach_coalesced_wheel_replays_mouse_report_events() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _runtime_guard = rt.enter();
+        let bytes = b"\x1b[?1000h\x1b[?1006hready\r\n";
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                20, 5, 4096, bytes, 4,
+            );
+        assert_eq!(
+            runtime.wheel_routing(),
+            Some(crate::pane::WheelRouting::MouseReport)
+        );
+
+        apply_terminal_attach_scroll(
+            &runtime,
+            AttachScrollSource::Wheel,
+            AttachScrollDirection::Up,
+            3,
+            Some(10),
+            Some(4),
+            KeyModifiers::CONTROL.bits(),
+        )
+        .expect("mouse report wheel forward");
+
+        let forwarded = input_rx.try_recv().expect("forwarded mouse reports");
+        assert_eq!(
+            forwarded.len() % 3,
+            0,
+            "coalesced lines must replay whole mouse reports"
+        );
+        let one_event_len = forwarded.len() / 3;
+        assert!(one_event_len > 0);
+        let first = &forwarded[..one_event_len];
+        assert_eq!(&forwarded[one_event_len..one_event_len * 2], first);
+        assert_eq!(&forwarded[one_event_len * 2..], first);
+
+        drop(runtime);
+        drop(_runtime_guard);
+        rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn terminal_attach_coalesced_wheel_replays_alternate_scroll_events() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _runtime_guard = rt.enter();
+        let bytes = b"\x1b[?1007h\x1b[?1049halternate\r\n";
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                20, 5, 4096, bytes, 4,
+            );
+        assert_eq!(
+            runtime.wheel_routing(),
+            Some(crate::pane::WheelRouting::AlternateScroll)
+        );
+
+        apply_terminal_attach_scroll(
+            &runtime,
+            AttachScrollSource::Wheel,
+            AttachScrollDirection::Down,
+            4,
+            None,
+            None,
+            0,
+        )
+        .expect("alternate scroll forward");
+
+        let forwarded = input_rx.try_recv().expect("forwarded alternate scroll");
+        assert_eq!(
+            forwarded.len() % 4,
+            0,
+            "coalesced lines must replay whole alternate-scroll keys"
+        );
+        let one_event_len = forwarded.len() / 4;
+        assert!(one_event_len > 0);
+        let first = &forwarded[..one_event_len];
+        for chunk in forwarded.chunks(one_event_len) {
+            assert_eq!(chunk, first);
+        }
+
         drop(runtime);
         drop(_runtime_guard);
         rt.shutdown_timeout(Duration::from_millis(100));

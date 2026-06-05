@@ -19,7 +19,7 @@ use std::io::{self, Write as _};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
@@ -38,6 +38,8 @@ use crate::protocol::{
 use crate::server::socket_paths::client_socket_path;
 
 static RECEIVED_KITTY_GRAPHICS_IDS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+
+const ATTACH_SCROLL_COALESCE_INTERVAL: Duration = Duration::from_millis(8);
 
 // ---------------------------------------------------------------------------
 // Client state
@@ -61,11 +63,209 @@ struct ClientState {
     mouse_scroll_lines: usize,
     /// Whether outer focus gain should force a full host-terminal redraw.
     redraw_on_focus_gained: bool,
+    /// Frame-budget coalescer for direct-attach wheel scroll bursts.
+    attach_wheel_scroll: AttachWheelScrollCoalescer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingAttachWheelScroll {
+    direction: AttachScrollDirection,
+    lines: u16,
+    column: Option<u16>,
+    row: Option<u16>,
+    modifiers: u8,
+}
+
+impl PendingAttachWheelScroll {
+    fn can_merge(&self, other: &Self) -> bool {
+        self.direction == other.direction
+            && self.column == other.column
+            && self.row == other.row
+            && self.modifiers == other.modifiers
+    }
+
+    fn add_lines(&mut self, lines: u16) {
+        self.lines = self.lines.saturating_add(lines);
+    }
+
+    fn into_message(self) -> ClientMessage {
+        ClientMessage::AttachScroll {
+            source: AttachScrollSource::Wheel,
+            direction: self.direction,
+            lines: self.lines,
+            column: self.column,
+            row: self.row,
+            modifiers: self.modifiers,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AttachWheelScrollCoalescer {
+    pending: Option<PendingAttachWheelScroll>,
+    last_emit_at: Option<Instant>,
+    interval: Duration,
+}
+
+#[derive(Debug)]
+enum AttachScrollMessages {
+    Empty,
+    One(ClientMessage),
+    Two(ClientMessage, ClientMessage),
+}
+
+struct AttachScrollMessagesIntoIter {
+    first: Option<ClientMessage>,
+    second: Option<ClientMessage>,
+}
+
+impl Iterator for AttachScrollMessagesIntoIter {
+    type Item = ClientMessage;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.first.take().or_else(|| self.second.take())
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = usize::from(self.first.is_some()) + usize::from(self.second.is_some());
+        (len, Some(len))
+    }
+}
+
+impl ExactSizeIterator for AttachScrollMessagesIntoIter {}
+
+impl IntoIterator for AttachScrollMessages {
+    type Item = ClientMessage;
+    type IntoIter = AttachScrollMessagesIntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        match self {
+            Self::Empty => AttachScrollMessagesIntoIter {
+                first: None,
+                second: None,
+            },
+            Self::One(message) => AttachScrollMessagesIntoIter {
+                first: Some(message),
+                second: None,
+            },
+            Self::Two(first, second) => AttachScrollMessagesIntoIter {
+                first: Some(first),
+                second: Some(second),
+            },
+        }
+    }
+}
+
+impl Default for AttachWheelScrollCoalescer {
+    fn default() -> Self {
+        Self::new(ATTACH_SCROLL_COALESCE_INTERVAL)
+    }
+}
+
+impl AttachWheelScrollCoalescer {
+    fn new(interval: Duration) -> Self {
+        Self {
+            pending: None,
+            last_emit_at: None,
+            interval,
+        }
+    }
+
+    fn push_scroll(
+        &mut self,
+        source: AttachScrollSource,
+        direction: AttachScrollDirection,
+        lines: u16,
+        column: Option<u16>,
+        row: Option<u16>,
+        modifiers: u8,
+        now: Instant,
+    ) -> AttachScrollMessages {
+        let AttachScrollSource::Wheel = source else {
+            let message = ClientMessage::AttachScroll {
+                source,
+                direction,
+                lines,
+                column,
+                row,
+                modifiers,
+            };
+            return match self.flush(now) {
+                Some(pending) => AttachScrollMessages::Two(pending, message),
+                None => AttachScrollMessages::One(message),
+            };
+        };
+
+        let incoming = PendingAttachWheelScroll {
+            direction,
+            lines,
+            column,
+            row,
+            modifiers,
+        };
+
+        if let Some(pending) = &mut self.pending {
+            if pending.can_merge(&incoming) {
+                pending.add_lines(incoming.lines);
+                return AttachScrollMessages::Empty;
+            }
+
+            let pending = self
+                .flush(now)
+                .expect("pending wheel scroll exists before changed-target flush");
+            self.last_emit_at = Some(now);
+            return AttachScrollMessages::Two(pending, incoming.into_message());
+        }
+
+        if self
+            .last_emit_at
+            .is_none_or(|last_emit_at| now.duration_since(last_emit_at) >= self.interval)
+        {
+            self.last_emit_at = Some(now);
+            AttachScrollMessages::One(incoming.into_message())
+        } else {
+            self.pending = Some(incoming);
+            AttachScrollMessages::Empty
+        }
+    }
+
+    fn flush_due(&mut self, now: Instant) -> Option<ClientMessage> {
+        let last_emit_at = self.last_emit_at?;
+        if now.duration_since(last_emit_at) < self.interval {
+            return None;
+        }
+        self.flush(now)
+    }
+
+    fn flush(&mut self, now: Instant) -> Option<ClientMessage> {
+        let pending = self.pending.take()?;
+        self.last_emit_at = Some(now);
+        Some(pending.into_message())
+    }
+
+    fn next_delay(&self, now: Instant) -> Option<Duration> {
+        self.pending.as_ref()?;
+        let last_emit_at = self.last_emit_at?;
+        Some(
+            self.interval
+                .saturating_sub(now.duration_since(last_emit_at)),
+        )
+    }
 }
 
 #[derive(Debug, Default)]
 struct AttachEscapeState {
     pending_prefix: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttachScrollRequest {
+    source: AttachScrollSource,
+    direction: AttachScrollDirection,
+    lines: u16,
+    column: Option<u16>,
+    row: Option<u16>,
+    modifiers: u8,
 }
 
 #[derive(Debug)]
@@ -79,6 +279,7 @@ enum AttachInputAction {
         row: Option<u16>,
         modifiers: u8,
     },
+    ScrollBatch(Vec<AttachScrollRequest>),
     Detach,
     None,
 }
@@ -91,6 +292,11 @@ impl AttachEscapeState {
         mouse_scroll_lines: usize,
     ) -> AttachInputAction {
         const PREFIX: u8 = 0x02; // Ctrl+B
+
+        if !self.pending_prefix && !data.contains(&PREFIX) {
+            return attach_scroll_action(&data, viewport_rows, mouse_scroll_lines)
+                .unwrap_or(AttachInputAction::Forward(data));
+        }
 
         let mut output = Vec::with_capacity(data.len());
         for byte in data {
@@ -127,6 +333,143 @@ impl AttachEscapeState {
 }
 
 fn attach_scroll_action(
+    data: &[u8],
+    viewport_rows: u16,
+    mouse_scroll_lines: usize,
+) -> Option<AttachInputAction> {
+    if let Some(action) = direct_attach_wheel_scroll_action(data, mouse_scroll_lines) {
+        return Some(action);
+    }
+
+    attach_scroll_action_with_generic_parser(data, viewport_rows, mouse_scroll_lines)
+}
+
+fn direct_attach_wheel_scroll_action(
+    data: &[u8],
+    mouse_scroll_lines: usize,
+) -> Option<AttachInputAction> {
+    let lines = mouse_scroll_lines.max(1).min(u16::MAX as usize) as u16;
+    let wheels = parse_direct_attach_sgr_wheel_sequence(data)?;
+    let mut requests = wheels.into_iter().map(|wheel| AttachScrollRequest {
+        source: AttachScrollSource::Wheel,
+        direction: wheel.direction,
+        lines,
+        column: Some(wheel.column),
+        row: Some(wheel.row),
+        modifiers: wheel.modifiers,
+    });
+
+    let first = requests.next()?;
+    if let Some(second) = requests.next() {
+        let mut batch = vec![first, second];
+        batch.extend(requests);
+        Some(AttachInputAction::ScrollBatch(batch))
+    } else {
+        Some(AttachInputAction::Scroll {
+            source: first.source,
+            direction: first.direction,
+            lines: first.lines,
+            column: first.column,
+            row: first.row,
+            modifiers: first.modifiers,
+        })
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct DirectAttachWheelScroll {
+    direction: AttachScrollDirection,
+    column: u16,
+    row: u16,
+    modifiers: u8,
+}
+
+fn parse_direct_attach_sgr_wheel_sequence(data: &[u8]) -> Option<Vec<DirectAttachWheelScroll>> {
+    if data.is_empty() {
+        return None;
+    }
+
+    let mut idx = 0;
+    let mut wheels = Vec::new();
+    while idx < data.len() {
+        let (wheel, next_idx) = parse_direct_attach_sgr_wheel_at(data, idx)?;
+        wheels.push(wheel);
+        idx = next_idx;
+    }
+    Some(wheels)
+}
+
+fn parse_direct_attach_sgr_wheel_at(
+    data: &[u8],
+    start_idx: usize,
+) -> Option<(DirectAttachWheelScroll, usize)> {
+    if !data.get(start_idx..)?.starts_with(b"\x1b[<") {
+        return None;
+    }
+
+    let mut idx = start_idx + 3;
+    let cb = parse_ascii_decimal(data, &mut idx, u8::MAX as u32)? as u8;
+    expect_byte(data, &mut idx, b';')?;
+    let column = (parse_ascii_decimal(data, &mut idx, u16::MAX as u32)? as u16).checked_sub(1)?;
+    expect_byte(data, &mut idx, b';')?;
+    let row = (parse_ascii_decimal(data, &mut idx, u16::MAX as u32)? as u16).checked_sub(1)?;
+    expect_byte(data, &mut idx, b'M')?;
+
+    let button_number = (cb & 0b0000_0011) | ((cb & 0b1100_0000) >> 4);
+    let dragging = cb & 0b0010_0000 == 0b0010_0000;
+    let direction = match (button_number, dragging) {
+        (4, false) => AttachScrollDirection::Up,
+        (5, false) => AttachScrollDirection::Down,
+        _ => return None,
+    };
+
+    let mut modifiers = KeyModifiers::empty();
+    if cb & 0b0000_0100 != 0 {
+        modifiers |= KeyModifiers::SHIFT;
+    }
+    if cb & 0b0000_1000 != 0 {
+        modifiers |= KeyModifiers::ALT;
+    }
+    if cb & 0b0001_0000 != 0 {
+        modifiers |= KeyModifiers::CONTROL;
+    }
+
+    Some((
+        DirectAttachWheelScroll {
+            direction,
+            column,
+            row,
+            modifiers: modifiers.bits(),
+        },
+        idx,
+    ))
+}
+
+fn parse_ascii_decimal(data: &[u8], idx: &mut usize, max: u32) -> Option<u32> {
+    let start = *idx;
+    let mut value = 0u32;
+    while let Some(byte) = data.get(*idx) {
+        if !byte.is_ascii_digit() {
+            break;
+        }
+        value = value.checked_mul(10)?.checked_add(u32::from(byte - b'0'))?;
+        if value > max {
+            return None;
+        }
+        *idx += 1;
+    }
+    (*idx > start).then_some(value)
+}
+
+fn expect_byte(data: &[u8], idx: &mut usize, expected: u8) -> Option<()> {
+    if data.get(*idx) != Some(&expected) {
+        return None;
+    }
+    *idx += 1;
+    Some(())
+}
+
+fn attach_scroll_action_with_generic_parser(
     data: &[u8],
     viewport_rows: u16,
     mouse_scroll_lines: usize,
@@ -181,6 +524,32 @@ fn attach_scroll_action(
         }
         _ => None,
     }
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct AttachScrollParserProbe {
+    fast_path_hits: usize,
+    generic_parse_calls: usize,
+}
+
+#[cfg(test)]
+fn attach_scroll_action_with_parser_probe(
+    data: &[u8],
+    viewport_rows: u16,
+    mouse_scroll_lines: usize,
+    probe: &mut AttachScrollParserProbe,
+) -> Option<AttachInputAction> {
+    if let Some(action) = direct_attach_wheel_scroll_action(data, mouse_scroll_lines) {
+        probe.fast_path_hits += match &action {
+            AttachInputAction::ScrollBatch(requests) => requests.len(),
+            _ => 1,
+        };
+        return Some(action);
+    }
+
+    probe.generic_parse_calls += 1;
+    attach_scroll_action_with_generic_parser(data, viewport_rows, mouse_scroll_lines)
 }
 
 impl ClientState {
@@ -681,6 +1050,7 @@ async fn run_client_loop(
         attach_escape,
         mouse_scroll_lines,
         redraw_on_focus_gained,
+        attach_wheel_scroll: AttachWheelScrollCoalescer::default(),
     };
     debug!(?negotiated_encoding, "client render encoding active");
 
@@ -733,9 +1103,20 @@ async fn run_client_loop(
 
     // Main event loop.
     while !should_quit.load(Ordering::Acquire) {
+        if let Some(msg) = state.attach_wheel_scroll.flush_due(Instant::now()) {
+            if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                return Err(ClientError::ConnectionLost(e));
+            }
+        }
+
+        let timer_delay = state
+            .attach_wheel_scroll
+            .next_delay(Instant::now())
+            .map(|delay| delay.min(Duration::from_millis(100)))
+            .unwrap_or(Duration::from_millis(100));
         let event = tokio::select! {
             ev = event_rx.recv() => ev.unwrap_or(ClientLoopEvent::Timer),
-            _ = tokio::time::sleep(Duration::from_millis(100)) => ClientLoopEvent::Timer,
+            _ = tokio::time::sleep(timer_delay) => ClientLoopEvent::Timer,
         };
 
         match event {
@@ -746,7 +1127,14 @@ async fn run_client_loop(
                         state.reported_size.1,
                         state.mouse_scroll_lines,
                     ) {
-                        AttachInputAction::Forward(data) => data,
+                        AttachInputAction::Forward(data) => {
+                            if let Some(msg) = state.attach_wheel_scroll.flush(Instant::now()) {
+                                if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                                    return Err(ClientError::ConnectionLost(e));
+                                }
+                            }
+                            data
+                        }
                         AttachInputAction::Scroll {
                             source,
                             direction,
@@ -755,21 +1143,47 @@ async fn run_client_loop(
                             row,
                             modifiers,
                         } => {
-                            let msg = ClientMessage::AttachScroll {
+                            let messages = state.attach_wheel_scroll.push_scroll(
                                 source,
                                 direction,
                                 lines,
                                 column,
                                 row,
                                 modifiers,
-                            };
-                            if let Err(e) = write_to_server(&mut write_stream, &msg) {
-                                return Err(ClientError::ConnectionLost(e));
+                                Instant::now(),
+                            );
+                            for msg in messages {
+                                if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                                    return Err(ClientError::ConnectionLost(e));
+                                }
+                            }
+                            continue;
+                        }
+                        AttachInputAction::ScrollBatch(requests) => {
+                            for request in requests {
+                                let messages = state.attach_wheel_scroll.push_scroll(
+                                    request.source,
+                                    request.direction,
+                                    request.lines,
+                                    request.column,
+                                    request.row,
+                                    request.modifiers,
+                                    Instant::now(),
+                                );
+                                for msg in messages {
+                                    if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                                        return Err(ClientError::ConnectionLost(e));
+                                    }
+                                }
                             }
                             continue;
                         }
                         AttachInputAction::Detach => {
-                            let _ = write_to_server(&mut write_stream, &ClientMessage::Detach);
+                            detach_from_server_after_flushing_attach_scroll(
+                                &mut state.attach_wheel_scroll,
+                                &mut write_stream,
+                                Instant::now(),
+                            )?;
                             return Ok(());
                         }
                         AttachInputAction::None => continue,
@@ -818,6 +1232,11 @@ async fn run_client_loop(
                 }
             }
             ClientLoopEvent::Resize(new_cols, new_rows, cell_width_px, cell_height_px) => {
+                if let Some(msg) = state.attach_wheel_scroll.flush(Instant::now()) {
+                    if let Err(e) = write_to_server(&mut write_stream, &msg) {
+                        return Err(ClientError::ConnectionLost(e));
+                    }
+                }
                 state.reported_size = (new_cols, new_rows);
                 let msg = ClientMessage::Resize {
                     cols: new_cols,
@@ -898,9 +1317,12 @@ async fn run_client_loop(
         }
     }
 
-    // Clean exit (Ctrl+C). Send Detach before closing.
-    let detach = ClientMessage::Detach;
-    let _ = write_to_server(&mut write_stream, &detach);
+    // Clean exit (Ctrl+C). Flush pending direct-attach wheel scroll before Detach.
+    detach_from_server_after_flushing_attach_scroll(
+        &mut state.attach_wheel_scroll,
+        &mut write_stream,
+        Instant::now(),
+    )?;
     let _ = io::stdout().flush();
 
     Ok(())
@@ -968,6 +1390,18 @@ fn server_reader_thread(
 /// Writes a message to the server stream (blocking).
 fn write_to_server(stream: &mut UnixStream, msg: &ClientMessage) -> io::Result<()> {
     protocol::write_message(stream, msg).map_err(|e| io::Error::other(e.to_string()))
+}
+
+fn detach_from_server_after_flushing_attach_scroll(
+    coalescer: &mut AttachWheelScrollCoalescer,
+    stream: &mut UnixStream,
+    now: Instant,
+) -> Result<(), ClientError> {
+    if let Some(msg) = coalescer.flush(now) {
+        write_to_server(stream, &msg).map_err(ClientError::ConnectionLost)?;
+    }
+    let _ = write_to_server(stream, &ClientMessage::Detach);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1360,6 +1794,493 @@ mod tests {
     fn terminal_frame_kitty_detection_matches_apc_prefix() {
         assert!(contains_kitty_graphics_bytes(b"text\x1b_Ga=p;\x1b\\"));
         assert!(!contains_kitty_graphics_bytes(b"text\x1b[?2026h"));
+    }
+
+    fn attach_scroll_lines(message: &ClientMessage) -> u16 {
+        match message {
+            ClientMessage::AttachScroll { lines, .. } => *lines,
+            other => panic!("expected AttachScroll, got {other:?}"),
+        }
+    }
+
+    fn attach_scroll_direction(message: &ClientMessage) -> AttachScrollDirection {
+        match message {
+            ClientMessage::AttachScroll { direction, .. } => *direction,
+            other => panic!("expected AttachScroll, got {other:?}"),
+        }
+    }
+
+    fn assert_wheel_scroll_action(
+        action: AttachInputAction,
+        expected_direction: AttachScrollDirection,
+        expected_lines: u16,
+        expected_column: Option<u16>,
+        expected_row: Option<u16>,
+        expected_modifiers: u8,
+    ) {
+        match action {
+            AttachInputAction::Scroll {
+                source,
+                direction,
+                lines,
+                column,
+                row,
+                modifiers,
+            } => {
+                assert_eq!(source, AttachScrollSource::Wheel);
+                assert_eq!(direction, expected_direction);
+                assert_eq!(lines, expected_lines);
+                assert_eq!(column, expected_column);
+                assert_eq!(row, expected_row);
+                assert_eq!(modifiers, expected_modifiers);
+            }
+            other => panic!("expected wheel scroll action, got {other:?}"),
+        }
+    }
+
+    fn push_wheel(
+        coalescer: &mut AttachWheelScrollCoalescer,
+        direction: AttachScrollDirection,
+        lines: u16,
+        row: Option<u16>,
+        now: Instant,
+    ) -> Vec<ClientMessage> {
+        push_wheel_at(coalescer, direction, lines, Some(4), row, 0, now)
+    }
+
+    fn push_wheel_at(
+        coalescer: &mut AttachWheelScrollCoalescer,
+        direction: AttachScrollDirection,
+        lines: u16,
+        column: Option<u16>,
+        row: Option<u16>,
+        modifiers: u8,
+        now: Instant,
+    ) -> Vec<ClientMessage> {
+        coalescer
+            .push_scroll(
+                AttachScrollSource::Wheel,
+                direction,
+                lines,
+                column,
+                row,
+                modifiers,
+                now,
+            )
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn attach_wheel_scroll_coalescer_preserves_direction_row_column_modifier_boundaries() {
+        let mut coalescer = AttachWheelScrollCoalescer::new(Duration::from_millis(16));
+        let now = Instant::now();
+
+        assert_eq!(
+            push_wheel_at(
+                &mut coalescer,
+                AttachScrollDirection::Up,
+                1,
+                Some(4),
+                Some(8),
+                0,
+                now,
+            )
+            .len(),
+            1
+        );
+        assert!(push_wheel_at(
+            &mut coalescer,
+            AttachScrollDirection::Up,
+            2,
+            Some(4),
+            Some(8),
+            0,
+            now + Duration::from_millis(1),
+        )
+        .is_empty());
+
+        for (direction, column, row, modifiers, pending_lines, incoming_lines) in [
+            (AttachScrollDirection::Down, Some(4), Some(8), 0, 2, 3),
+            (AttachScrollDirection::Down, Some(5), Some(8), 0, 4, 5),
+            (AttachScrollDirection::Down, Some(5), Some(9), 0, 6, 7),
+            (
+                AttachScrollDirection::Down,
+                Some(5),
+                Some(9),
+                KeyModifiers::CONTROL.bits(),
+                8,
+                9,
+            ),
+        ] {
+            let messages = push_wheel_at(
+                &mut coalescer,
+                direction,
+                incoming_lines,
+                column,
+                row,
+                modifiers,
+                now + Duration::from_millis(u64::from(incoming_lines)),
+            );
+            assert_eq!(messages.len(), 2);
+            assert_eq!(attach_scroll_lines(&messages[0]), pending_lines);
+            assert_eq!(attach_scroll_lines(&messages[1]), incoming_lines);
+            assert_eq!(attach_scroll_direction(&messages[1]), direction);
+
+            assert!(push_wheel_at(
+                &mut coalescer,
+                direction,
+                incoming_lines + 1,
+                column,
+                row,
+                modifiers,
+                now + Duration::from_millis(u64::from(incoming_lines + 1)),
+            )
+            .is_empty());
+        }
+    }
+
+    #[test]
+    fn detach_flushes_pending_wheel_scroll_before_detach_message() {
+        let mut coalescer = AttachWheelScrollCoalescer::new(Duration::from_millis(16));
+        let now = Instant::now();
+        let (mut write_stream, mut read_stream) = UnixStream::pair().expect("socket pair");
+
+        let first = push_wheel(&mut coalescer, AttachScrollDirection::Down, 2, Some(8), now);
+        assert_eq!(first.len(), 1);
+        write_to_server(&mut write_stream, &first[0]).expect("write first scroll");
+        assert!(push_wheel(
+            &mut coalescer,
+            AttachScrollDirection::Down,
+            3,
+            Some(8),
+            now + Duration::from_millis(1),
+        )
+        .is_empty());
+
+        detach_from_server_after_flushing_attach_scroll(
+            &mut coalescer,
+            &mut write_stream,
+            now + Duration::from_millis(2),
+        )
+        .expect("flush before detach");
+
+        let first: ClientMessage =
+            protocol::read_message(&mut read_stream, MAX_FRAME_SIZE).expect("read first scroll");
+        assert_eq!(attach_scroll_lines(&first), 2);
+        let flushed: ClientMessage =
+            protocol::read_message(&mut read_stream, MAX_FRAME_SIZE).expect("read flushed scroll");
+        assert_eq!(attach_scroll_lines(&flushed), 3);
+        let detach: ClientMessage =
+            protocol::read_message(&mut read_stream, MAX_FRAME_SIZE).expect("read detach");
+        assert!(matches!(detach, ClientMessage::Detach));
+    }
+
+    #[test]
+    fn attach_wheel_scroll_coalescer_flushes_before_page_key_scroll() {
+        let mut coalescer = AttachWheelScrollCoalescer::new(Duration::from_millis(16));
+        let now = Instant::now();
+
+        assert_eq!(
+            push_wheel(&mut coalescer, AttachScrollDirection::Up, 3, Some(8), now).len(),
+            1
+        );
+        assert!(push_wheel(
+            &mut coalescer,
+            AttachScrollDirection::Up,
+            3,
+            Some(8),
+            now + Duration::from_millis(1),
+        )
+        .is_empty());
+
+        let messages: Vec<_> = coalescer
+            .push_scroll(
+                AttachScrollSource::PageKey {
+                    input: b"\x1b[5~".to_vec(),
+                },
+                AttachScrollDirection::Up,
+                20,
+                None,
+                None,
+                0,
+                now + Duration::from_millis(2),
+            )
+            .into_iter()
+            .collect();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(attach_scroll_lines(&messages[0]), 3);
+        assert_eq!(attach_scroll_lines(&messages[1]), 20);
+    }
+
+    #[test]
+    fn direct_attach_wheel_fast_path_recognizes_sgr_wheel_up_and_down() {
+        let mut probe = AttachScrollParserProbe::default();
+
+        let up = attach_scroll_action_with_parser_probe(b"\x1b[<64;11;6M", 24, 7, &mut probe)
+            .expect("wheel up");
+        assert_wheel_scroll_action(up, AttachScrollDirection::Up, 7, Some(10), Some(5), 0);
+
+        let down = attach_scroll_action_with_parser_probe(b"\x1b[<65;11;6M", 24, 7, &mut probe)
+            .expect("wheel down");
+        assert_wheel_scroll_action(down, AttachScrollDirection::Down, 7, Some(10), Some(5), 0);
+
+        assert_eq!(probe.fast_path_hits, 2);
+        assert_eq!(
+            probe.generic_parse_calls, 0,
+            "recognized wheel events must not invoke the generic raw parser"
+        );
+    }
+
+    #[test]
+    fn direct_attach_wheel_fast_path_preserves_boundaries_and_modifiers() {
+        let mut probe = AttachScrollParserProbe::default();
+        let modifiers = (KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL).bits();
+
+        let action =
+            attach_scroll_action_with_parser_probe(b"\x1b[<92;1;65535M", 24, 0, &mut probe)
+                .expect("modified boundary wheel");
+
+        assert_wheel_scroll_action(
+            action,
+            AttachScrollDirection::Up,
+            1,
+            Some(0),
+            Some(65534),
+            modifiers,
+        );
+        assert_eq!(probe.fast_path_hits, 1);
+        assert_eq!(probe.generic_parse_calls, 0);
+    }
+
+    #[test]
+    fn direct_attach_wheel_fast_path_falls_back_for_unsupported_mixed_or_incomplete_input() {
+        let mut probe = AttachScrollParserProbe::default();
+
+        assert!(matches!(
+            attach_scroll_action_with_parser_probe(b"\x1b[<0;11;6M", 24, 7, &mut probe),
+            Some(AttachInputAction::None)
+        ));
+        assert!(
+            attach_scroll_action_with_parser_probe(b"\x1b[<64;11;6Mx", 24, 7, &mut probe).is_none()
+        );
+        assert!(
+            attach_scroll_action_with_parser_probe(b"\x1b[<64;11;6", 24, 7, &mut probe).is_none()
+        );
+        let release_fallback =
+            attach_scroll_action_with_parser_probe(b"\x1b[<65;11;6m", 24, 7, &mut probe)
+                .expect("existing parser handles lowercase SGR final byte");
+        assert_wheel_scroll_action(
+            release_fallback,
+            AttachScrollDirection::Down,
+            7,
+            Some(10),
+            Some(5),
+            0,
+        );
+
+        assert_eq!(probe.fast_path_hits, 0);
+        assert_eq!(
+            probe.generic_parse_calls, 4,
+            "unsupported, mixed, incomplete, and lowercase-final inputs must use the existing parser fallback"
+        );
+    }
+
+    #[test]
+    fn direct_attach_wheel_fast_path_batches_consecutive_packets_without_generic_parser() {
+        let mut probe = AttachScrollParserProbe::default();
+        let action = attach_scroll_action_with_parser_probe(
+            b"\x1b[<64;11;6M\x1b[<64;11;6M\x1b[<65;12;7M",
+            24,
+            7,
+            &mut probe,
+        )
+        .expect("batched wheel packets");
+
+        let AttachInputAction::ScrollBatch(requests) = action else {
+            panic!("expected wheel batch action");
+        };
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[0].direction, AttachScrollDirection::Up);
+        assert_eq!(requests[0].column, Some(10));
+        assert_eq!(requests[0].row, Some(5));
+        assert_eq!(requests[1].direction, AttachScrollDirection::Up);
+        assert_eq!(requests[2].direction, AttachScrollDirection::Down);
+        assert_eq!(requests[2].column, Some(11));
+        assert_eq!(requests[2].row, Some(6));
+
+        let mut coalescer = AttachWheelScrollCoalescer::new(Duration::from_millis(16));
+        let now = Instant::now();
+        let mut emitted = Vec::new();
+        for request in requests {
+            emitted.extend(coalescer.push_scroll(
+                request.source,
+                request.direction,
+                request.lines,
+                request.column,
+                request.row,
+                request.modifiers,
+                now,
+            ));
+        }
+
+        assert_eq!(emitted.len(), 3);
+        assert_eq!(
+            attach_scroll_direction(&emitted[0]),
+            AttachScrollDirection::Up
+        );
+        assert_eq!(attach_scroll_lines(&emitted[0]), 7);
+        assert_eq!(
+            attach_scroll_direction(&emitted[1]),
+            AttachScrollDirection::Up
+        );
+        assert_eq!(attach_scroll_lines(&emitted[1]), 7);
+        assert_eq!(
+            attach_scroll_direction(&emitted[2]),
+            AttachScrollDirection::Down
+        );
+        assert_eq!(attach_scroll_lines(&emitted[2]), 7);
+        assert_eq!(probe.fast_path_hits, 3);
+        assert_eq!(probe.generic_parse_calls, 0);
+    }
+
+    #[test]
+    fn direct_attach_wheel_fast_path_mixed_packet_and_input_uses_fallback() {
+        let mut probe = AttachScrollParserProbe::default();
+
+        assert!(
+            attach_scroll_action_with_parser_probe(b"\x1b[<64;11;6Mx", 24, 7, &mut probe).is_none()
+        );
+
+        assert_eq!(probe.fast_path_hits, 0);
+        assert_eq!(probe.generic_parse_calls, 1);
+    }
+
+    #[test]
+    fn direct_attach_wheel_fast_path_incomplete_trailing_packet_uses_fallback() {
+        let mut probe = AttachScrollParserProbe::default();
+
+        let action = attach_scroll_action_with_parser_probe(
+            b"\x1b[<64;11;6M\x1b[<64;11;6",
+            24,
+            7,
+            &mut probe,
+        )
+        .expect("existing parser behavior is preserved for incomplete trailing input");
+
+        assert_wheel_scroll_action(action, AttachScrollDirection::Up, 7, Some(10), Some(5), 0);
+        assert_eq!(probe.fast_path_hits, 0);
+        assert_eq!(probe.generic_parse_calls, 1);
+    }
+
+    #[test]
+    fn direct_attach_wheel_fast_path_burst_uses_coalescer_without_generic_parser() {
+        let mut coalescer = AttachWheelScrollCoalescer::new(Duration::from_millis(16));
+        let now = Instant::now();
+        let mut probe = AttachScrollParserProbe::default();
+        let mut emitted = 0usize;
+        let mut emitted_lines = 0usize;
+
+        for idx in 0..10_000 {
+            let action =
+                attach_scroll_action_with_parser_probe(b"\x1b[<64;11;6M", 24, 1, &mut probe)
+                    .expect("synthetic wheel");
+            let AttachInputAction::Scroll {
+                source,
+                direction,
+                lines,
+                column,
+                row,
+                modifiers,
+            } = action
+            else {
+                panic!("expected scroll action");
+            };
+
+            for msg in coalescer.push_scroll(
+                source,
+                direction,
+                lines,
+                column,
+                row,
+                modifiers,
+                now + Duration::from_millis(usize::from(idx > 0) as u64),
+            ) {
+                emitted += 1;
+                emitted_lines += usize::from(attach_scroll_lines(&msg));
+            }
+        }
+
+        if let Some(msg) = coalescer.flush_due(now + Duration::from_millis(16)) {
+            emitted += 1;
+            emitted_lines += usize::from(attach_scroll_lines(&msg));
+        }
+
+        assert_eq!(probe.fast_path_hits, 10_000);
+        assert_eq!(probe.generic_parse_calls, 0);
+        assert!(
+            emitted <= 2,
+            "stable wheel burst should emit bounded client messages, got {emitted}"
+        );
+        assert_eq!(emitted_lines, 10_000);
+    }
+
+    #[test]
+    fn direct_attach_wheel_fast_path_sustained_inertia_stream_skips_generic_parser() {
+        let mut coalescer = AttachWheelScrollCoalescer::new(Duration::from_millis(8));
+        let start = Instant::now();
+        let mut now = start;
+        let mut probe = AttachScrollParserProbe::default();
+        let mut emitted = 0usize;
+        let mut emitted_lines = 0usize;
+        let mut packets = 0usize;
+
+        for packet in 0..600 {
+            now += Duration::from_micros(1_000 + packet * 4);
+
+            if let Some(msg) = coalescer.flush_due(now) {
+                emitted += 1;
+                emitted_lines += usize::from(attach_scroll_lines(&msg));
+            }
+
+            let action =
+                attach_scroll_action_with_parser_probe(b"\x1b[<65;11;6M", 24, 1, &mut probe)
+                    .expect("synthetic inertial wheel packet");
+            let AttachInputAction::Scroll {
+                source,
+                direction,
+                lines,
+                column,
+                row,
+                modifiers,
+            } = action
+            else {
+                panic!("expected scroll action");
+            };
+
+            for msg in coalescer.push_scroll(source, direction, lines, column, row, modifiers, now)
+            {
+                emitted += 1;
+                emitted_lines += usize::from(attach_scroll_lines(&msg));
+            }
+            packets += 1;
+        }
+
+        if let Some(msg) = coalescer.flush(now) {
+            emitted += 1;
+            emitted_lines += usize::from(attach_scroll_lines(&msg));
+        }
+
+        let elapsed_ms = now.duration_since(start).as_millis() as usize;
+        let frame_bound = elapsed_ms.div_ceil(8) + 2;
+        assert_eq!(probe.fast_path_hits, packets);
+        assert_eq!(probe.generic_parse_calls, 0);
+        assert_eq!(emitted_lines, packets);
+        assert!(
+            emitted <= frame_bound,
+            "sustained inertial stream should emit around frame cadence, got {emitted} messages over {elapsed_ms}ms"
+        );
     }
 
     #[test]
