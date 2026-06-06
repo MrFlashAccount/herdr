@@ -254,7 +254,9 @@ pub(super) fn render_panes(
 
     for info in &app.view.pane_infos {
         if let Some(rt) = app.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, info.id) {
+            crate::render_prof::event("full_render.panes.rendered");
             if multi_pane {
+                let border_started = crate::render_prof::timer();
                 let (border_style, border_set) = if info.is_focused && terminal_active {
                     (
                         Style::default().fg(app.palette.accent),
@@ -287,14 +289,24 @@ pub(super) fn render_panes(
                     block = block.title(Line::from(Span::styled(title, border_style)));
                 }
                 frame.render_widget(block, info.rect);
+                crate::render_prof::duration_since("full_render.panes.border", border_started);
             }
 
             let show_cursor = info.is_focused && terminal_active && !pane_is_scrolled_back(rt);
+            let terminal_started = crate::render_prof::timer();
             rt.render(frame, info.inner_rect, show_cursor);
+            crate::render_prof::duration_since(
+                "full_render.panes.terminal_render",
+                terminal_started,
+            );
+
+            let scrollbar_started = crate::render_prof::timer();
             render_pane_scrollbar(app, frame, info, rt);
+            crate::render_prof::duration_since("full_render.panes.scrollbar", scrollbar_started);
 
             let should_dim = !info.is_focused && multi_pane && !terminal_active;
             if should_dim {
+                let dim_started = crate::render_prof::timer();
                 let inner = info.inner_rect;
                 let buf = frame.buffer_mut();
                 for y in inner.y..inner.y + inner.height {
@@ -303,8 +315,10 @@ pub(super) fn render_panes(
                         cell.set_style(cell.style().add_modifier(Modifier::DIM));
                     }
                 }
+                crate::render_prof::duration_since("full_render.panes.dim", dim_started);
             }
 
+            let selection_started = crate::render_prof::timer();
             render_selection_highlight(
                 &app.selection,
                 frame,
@@ -314,7 +328,14 @@ pub(super) fn render_panes(
                 &app.palette,
                 app.host_terminal_theme,
             );
+            crate::render_prof::duration_since("full_render.panes.selection", selection_started);
+
+            let copy_cursor_started = crate::render_prof::timer();
             render_copy_mode_cursor(app, frame, info);
+            crate::render_prof::duration_since(
+                "full_render.panes.copy_cursor",
+                copy_cursor_started,
+            );
         }
     }
 }

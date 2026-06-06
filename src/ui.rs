@@ -360,6 +360,7 @@ pub fn render_with_runtime_registry(
     let tab_bar_area = app.view.tab_bar_rect;
     let terminal_area = app.view.terminal_area;
 
+    let sidebar_started = crate::render_prof::timer();
     if app.view.layout == ViewLayout::Mobile {
         render_mobile_header(app, terminal_runtimes, frame, app.view.mobile_header_rect);
     } else if app.sidebar_collapsed {
@@ -367,14 +368,24 @@ pub fn render_with_runtime_registry(
     } else {
         render_sidebar(app, terminal_runtimes, frame, sidebar_area);
     }
+    crate::render_prof::duration_since("full_render.ui.sidebar", sidebar_started);
+
     if app.view.layout != ViewLayout::Mobile {
+        let tab_bar_started = crate::render_prof::timer();
         render_tab_bar(app, frame, tab_bar_area);
+        crate::render_prof::duration_since("full_render.ui.tab_bar", tab_bar_started);
     }
+
+    let panes_started = crate::render_prof::timer();
     render_panes(app, terminal_runtimes, frame, terminal_area);
+    crate::render_prof::duration_since("full_render.ui.panes", panes_started);
 
     // Ambient notifications sit above panes, but below interactive overlays.
+    let notifications_started = crate::render_prof::timer();
     render_notifications(app, frame, terminal_area);
+    crate::render_prof::duration_since("full_render.ui.notifications", notifications_started);
 
+    let overlay_started = crate::render_prof::timer();
     match app.mode {
         Mode::Onboarding => render_onboarding_overlay(app, frame, frame.area()),
         Mode::ReleaseNotes => render_release_notes_overlay(app, frame, frame.area()),
@@ -404,6 +415,7 @@ pub fn render_with_runtime_registry(
         Mode::Navigator => render_navigator_overlay(app, terminal_runtimes, frame),
         Mode::Terminal => {}
     }
+    crate::render_prof::duration_since("full_render.ui.overlay", overlay_started);
 }
 
 fn render_notifications(app: &AppState, frame: &mut Frame, terminal_area: Rect) {

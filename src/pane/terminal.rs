@@ -1037,9 +1037,13 @@ impl GhosttyPaneTerminal {
     }
 
     pub fn render(&self, frame: &mut Frame, area: Rect, show_cursor: bool) {
+        let lock_started = crate::render_prof::timer();
         let Ok(mut core) = self.core.lock() else {
+            crate::render_prof::duration_since("full_render.terminal.lock", lock_started);
             return;
         };
+        crate::render_prof::duration_since("full_render.terminal.lock", lock_started);
+
         let host_theme = core.host_terminal_theme;
         let initial_default_foreground = core.initial_default_foreground;
         let initial_default_background = core.initial_default_background;
@@ -1048,9 +1052,21 @@ impl GhosttyPaneTerminal {
             render_state,
             ..
         } = &mut *core;
+
+        let update_started = crate::render_prof::timer();
         if render_state.update(terminal).is_err() {
+            crate::render_prof::duration_since(
+                "full_render.terminal.render_state_update",
+                update_started,
+            );
             return;
         }
+        crate::render_prof::duration_since(
+            "full_render.terminal.render_state_update",
+            update_started,
+        );
+
+        let colors_started = crate::render_prof::timer();
         let colors = render_state.colors().ok();
         let default_bg = colors
             .and_then(|c| ghostty_default_bg(c.background, host_theme, initial_default_background));
@@ -1059,6 +1075,7 @@ impl GhosttyPaneTerminal {
         let resolved_fg = colors.map(|c| ghostty_color(c.foreground));
         let resolved_bg = colors.map(|c| ghostty_color(c.background));
         let hide_kitty_placeholders = crate::kitty_graphics::is_enabled();
+        crate::render_prof::duration_since("full_render.terminal.colors", colors_started);
 
         let mut row_iterator = match crate::ghostty::RowIterator::new() {
             Ok(iterator) => iterator,
@@ -1068,6 +1085,10 @@ impl GhosttyPaneTerminal {
             Ok(cells) => cells,
             Err(_) => return,
         };
+        let mut rows_rendered = 0u64;
+        let mut cells_rendered = 0u64;
+        let mut wide_cells = 0u64;
+        let cell_loop_started = crate::render_prof::timer();
         {
             let buf = frame.buffer_mut();
             let mut rows = match render_state.populate_row_iterator(&mut row_iterator) {
@@ -1085,6 +1106,9 @@ impl GhosttyPaneTerminal {
                 let mut x = 0u16;
                 while x < area.width && cells.next() {
                     let basic = cells.basic_data().unwrap_or_default();
+                    if basic.wide == crate::ghostty::CellWide::Wide {
+                        wide_cells += 1;
+                    }
                     let style = ghostty_cell_style(
                         &cells,
                         &basic,
@@ -1111,26 +1135,38 @@ impl GhosttyPaneTerminal {
                     cell.reset();
                     cell.set_symbol(symbol);
                     cell.set_style(style);
+                    cells_rendered += 1;
                     x += 1;
                 }
                 while x < area.width {
                     let cell = &mut buf[(area.x + x, area.y + y)];
                     ghostty_reset_cell(cell, default_fg, default_bg);
+                    cells_rendered += 1;
                     x += 1;
                 }
+                rows_rendered += 1;
                 y += 1;
             }
             while y < area.height {
                 for x in 0..area.width {
                     let cell = &mut buf[(area.x + x, area.y + y)];
                     ghostty_reset_cell(cell, default_fg, default_bg);
+                    cells_rendered += 1;
                 }
+                rows_rendered += 1;
                 y += 1;
             }
         }
+        crate::render_prof::duration_since("full_render.terminal.cell_loop", cell_loop_started);
+        crate::render_prof::counter("full_render.terminal.rows_rendered", rows_rendered);
+        crate::render_prof::counter("full_render.terminal.cells_rendered", cells_rendered);
+        crate::render_prof::counter("full_render.terminal.wide_cells", wide_cells);
 
+        let clear_dirty_started = crate::render_prof::timer();
         ghostty_clear_render_dirty(render_state, area.height);
+        crate::render_prof::duration_since("full_render.terminal.clear_dirty", clear_dirty_started);
 
+        let cursor_started = crate::render_prof::timer();
         if show_cursor && render_state.cursor_visible().ok() == Some(true) {
             if let Ok(Some(cursor)) = render_state.cursor_viewport() {
                 if cursor.x < area.width && cursor.y < area.height {
@@ -1138,6 +1174,7 @@ impl GhosttyPaneTerminal {
                 }
             }
         }
+        crate::render_prof::duration_since("full_render.terminal.cursor", cursor_started);
     }
 
     pub fn collect_dirty_patch(

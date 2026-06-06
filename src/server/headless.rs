@@ -200,7 +200,118 @@ pub struct HeadlessServer {
     pending_server_event: Option<ServerEvent>,
 }
 
+#[derive(Debug, Clone)]
+struct PendingTerminalAttachWheelScroll {
+    client_id: u64,
+    direction: AttachScrollDirection,
+    lines: u16,
+    column: Option<u16>,
+    row: Option<u16>,
+    modifiers: u8,
+}
+
+impl PendingTerminalAttachWheelScroll {
+    fn add_lines(&mut self, lines: u16) {
+        self.lines = self.lines.saturating_add(lines);
+    }
+}
+
+fn attach_scroll_direction_name(direction: AttachScrollDirection) -> &'static str {
+    match direction {
+        AttachScrollDirection::Up => "up",
+        AttachScrollDirection::Down => "down",
+    }
+}
+
+fn trace_pending_scroll(value: Option<&PendingTerminalAttachWheelScroll>) -> String {
+    value
+        .map(|pending| {
+            crate::render_prof::trace_string(format!(
+                "client={}:{}:{}",
+                pending.client_id,
+                attach_scroll_direction_name(pending.direction),
+                pending.lines
+            ))
+        })
+        .unwrap_or_else(|| "null".to_owned())
+}
+
+fn trace_server_attach_scroll_recv(
+    client_id: u64,
+    source: &AttachScrollSource,
+    direction: AttachScrollDirection,
+    lines: u16,
+) {
+    if !crate::render_prof::enabled() {
+        return;
+    }
+    crate::render_prof::trace_event(
+        "server.attach_scroll.recv",
+        &[
+            ("client_id", client_id.to_string()),
+            (
+                "source",
+                crate::render_prof::trace_string(format!("{source:?}")),
+            ),
+            (
+                "dir",
+                crate::render_prof::trace_string(attach_scroll_direction_name(direction)),
+            ),
+            ("lines", lines.to_string()),
+        ],
+    );
+}
+
+fn trace_server_attach_scroll_coalesce(
+    pending_before: Option<&PendingTerminalAttachWheelScroll>,
+    incoming: &PendingTerminalAttachWheelScroll,
+    action: &'static str,
+    pending_after: Option<&PendingTerminalAttachWheelScroll>,
+) {
+    if !crate::render_prof::enabled() {
+        return;
+    }
+    crate::render_prof::trace_event(
+        "server.attach_scroll.coalesce",
+        &[
+            ("pending_before", trace_pending_scroll(pending_before)),
+            (
+                "incoming",
+                crate::render_prof::trace_string(format!(
+                    "client={}:{}:{}",
+                    incoming.client_id,
+                    attach_scroll_direction_name(incoming.direction),
+                    incoming.lines
+                )),
+            ),
+            ("action", crate::render_prof::trace_string(action)),
+            ("pending_after", trace_pending_scroll(pending_after)),
+        ],
+    );
+}
+
+fn viewport_boundary_blocks_scroll(
+    runtime: &crate::terminal::TerminalRuntime,
+    direction: AttachScrollDirection,
+) -> bool {
+    let Some(metrics) = runtime.scroll_metrics() else {
+        return false;
+    };
+    match direction {
+        AttachScrollDirection::Up => metrics.offset_from_bottom >= metrics.max_offset_from_bottom,
+        AttachScrollDirection::Down => metrics.offset_from_bottom == 0,
+    }
+}
+
+fn terminal_attach_scroll_uses_viewport(runtime: &crate::terminal::TerminalRuntime) -> bool {
+    matches!(
+        runtime.wheel_routing(),
+        Some(crate::pane::WheelRouting::HostScroll) | None
+    )
+}
+
 fn apply_terminal_attach_scroll(
+    client_id: u64,
     runtime: &crate::terminal::TerminalRuntime,
     source: AttachScrollSource,
     direction: AttachScrollDirection,
@@ -208,7 +319,44 @@ fn apply_terminal_attach_scroll(
     column: Option<u16>,
     row: Option<u16>,
     modifiers: u8,
-) -> Result<(), String> {
+) -> Result<bool, String> {
+    crate::render_prof::event("server.attach_scroll.received");
+    let total_started = crate::render_prof::timer();
+    let source_name = format!("{source:?}");
+    let trace_apply = |applied_lines: u16,
+                       before: Option<usize>,
+                       after: Option<usize>,
+                       max: Option<usize>,
+                       changed: bool,
+                       action: &'static str| {
+        if !crate::render_prof::enabled() {
+            return;
+        }
+        crate::render_prof::trace_event(
+            "server.attach_scroll.apply",
+            &[
+                (
+                    "dir",
+                    crate::render_prof::trace_string(attach_scroll_direction_name(direction)),
+                ),
+                ("client_id", client_id.to_string()),
+                ("source", crate::render_prof::trace_string(&source_name)),
+                ("requested_lines", lines.to_string()),
+                ("applied_lines", applied_lines.to_string()),
+                (
+                    "viewport_offset_before",
+                    crate::render_prof::trace_opt(before),
+                ),
+                (
+                    "viewport_offset_after",
+                    crate::render_prof::trace_opt(after),
+                ),
+                ("viewport_max", crate::render_prof::trace_opt(max)),
+                ("changed", changed.to_string()),
+                ("action", crate::render_prof::trace_string(action)),
+            ],
+        );
+    };
     let wheel_kind = match direction {
         AttachScrollDirection::Up => MouseEventKind::ScrollUp,
         AttachScrollDirection::Down => MouseEventKind::ScrollDown,
@@ -218,13 +366,48 @@ fn apply_terminal_attach_scroll(
             !input_state.alternate_screen && !input_state.mouse_reporting_enabled()
         });
         if host_scroll {
+            let before_metrics = runtime.scroll_metrics();
+            let before_offset = before_metrics
+                .as_ref()
+                .map(|metrics| metrics.offset_from_bottom);
+            let max_offset = before_metrics
+                .as_ref()
+                .map(|metrics| metrics.max_offset_from_bottom);
+            let viewport_started = crate::render_prof::timer();
             match direction {
                 AttachScrollDirection::Up => runtime.scroll_up(lines.max(1) as usize),
                 AttachScrollDirection::Down => runtime.scroll_down(lines.max(1) as usize),
             }
-            return Ok(());
+            crate::render_prof::duration_since(
+                "server.attach_scroll.viewport_apply",
+                viewport_started,
+            );
+            let after_offset = runtime
+                .scroll_metrics()
+                .map(|metrics| metrics.offset_from_bottom);
+            crate::render_prof::duration_since("server.attach_scroll.apply_total", total_started);
+            let changed = before_offset != after_offset;
+            trace_apply(
+                lines.max(1),
+                before_offset,
+                after_offset,
+                max_offset,
+                changed,
+                "pagekey_viewport",
+            );
+            return Ok(changed);
         }
-        return apply_terminal_attach_input(runtime, input);
+        let result = apply_terminal_attach_input(runtime, input).map(|()| true);
+        crate::render_prof::duration_since("server.attach_scroll.apply_total", total_started);
+        trace_apply(
+            lines.max(1),
+            None,
+            None,
+            None,
+            result.is_ok(),
+            "pagekey_input",
+        );
+        return result;
     }
 
     match runtime.wheel_routing() {
@@ -247,30 +430,105 @@ fn apply_terminal_attach_scroll(
             for _ in 0..event_count {
                 repeated.extend_from_slice(&bytes);
             }
+            let enqueue_started = crate::render_prof::timer();
             runtime
                 .try_send_bytes(Bytes::from(repeated))
                 .map_err(|err| format!("terminal attach mouse wheel input failed: {err}"))?;
+            crate::render_prof::duration_since(
+                "server.attach_scroll.pty_try_send",
+                enqueue_started,
+            );
+            trace_apply(lines.max(1), None, None, None, true, "mouse_report");
         }
         Some(crate::pane::WheelRouting::AlternateScroll) => {
             runtime.scroll_reset();
             let Some(bytes) = runtime.encode_alternate_scroll(wheel_kind) else {
-                return Ok(());
+                crate::render_prof::duration_since(
+                    "server.attach_scroll.apply_total",
+                    total_started,
+                );
+                trace_apply(0, None, None, None, false, "alternate_scroll_noop");
+                return Ok(false);
             };
             let event_count = usize::from(lines.max(1));
             let mut repeated = Vec::with_capacity(bytes.len().saturating_mul(event_count));
             for _ in 0..event_count {
                 repeated.extend_from_slice(&bytes);
             }
+            let enqueue_started = crate::render_prof::timer();
             runtime
                 .try_send_bytes(Bytes::from(repeated))
                 .map_err(|err| format!("terminal attach alternate scroll input failed: {err}"))?;
+            crate::render_prof::duration_since(
+                "server.attach_scroll.pty_try_send",
+                enqueue_started,
+            );
+            trace_apply(lines.max(1), None, None, None, true, "alternate_scroll");
         }
-        Some(crate::pane::WheelRouting::HostScroll) | None => match direction {
-            AttachScrollDirection::Up => runtime.scroll_up(lines.max(1) as usize),
-            AttachScrollDirection::Down => runtime.scroll_down(lines.max(1) as usize),
-        },
+        Some(crate::pane::WheelRouting::HostScroll) | None => {
+            if matches!(source, AttachScrollSource::Wheel)
+                && viewport_boundary_blocks_scroll(runtime, direction)
+            {
+                crate::render_prof::event("server.attach_scroll.drop_boundary_wheel");
+                crate::render_prof::duration_since(
+                    "server.attach_scroll.apply_total",
+                    total_started,
+                );
+                let metrics = runtime.scroll_metrics();
+                let offset = metrics.as_ref().map(|metrics| metrics.offset_from_bottom);
+                let max = metrics
+                    .as_ref()
+                    .map(|metrics| metrics.max_offset_from_bottom);
+                trace_apply(0, offset, offset, max, false, "drop_boundary");
+                return Ok(false);
+            }
+            let before_metrics = runtime.scroll_metrics();
+            let before_offset = before_metrics
+                .as_ref()
+                .map(|metrics| metrics.offset_from_bottom);
+            let max_offset = before_metrics
+                .as_ref()
+                .map(|metrics| metrics.max_offset_from_bottom);
+            match direction {
+                AttachScrollDirection::Up => {
+                    let viewport_started = crate::render_prof::timer();
+                    runtime.scroll_up(lines.max(1) as usize);
+                    crate::render_prof::duration_since(
+                        "server.attach_scroll.viewport_apply",
+                        viewport_started,
+                    );
+                }
+                AttachScrollDirection::Down => {
+                    let viewport_started = crate::render_prof::timer();
+                    runtime.scroll_down(lines.max(1) as usize);
+                    crate::render_prof::duration_since(
+                        "server.attach_scroll.viewport_apply",
+                        viewport_started,
+                    );
+                }
+            }
+            let after_offset = runtime
+                .scroll_metrics()
+                .map(|metrics| metrics.offset_from_bottom);
+            crate::render_prof::duration_since("server.attach_scroll.apply_total", total_started);
+            let changed = before_offset != after_offset;
+            let applied_lines = before_offset
+                .zip(after_offset)
+                .map(|(before, after)| before.abs_diff(after) as u16)
+                .unwrap_or_else(|| if changed { lines.max(1) } else { 0 });
+            trace_apply(
+                applied_lines,
+                before_offset,
+                after_offset,
+                max_offset,
+                changed,
+                "viewport",
+            );
+            return Ok(changed);
+        }
     }
-    Ok(())
+    crate::render_prof::duration_since("server.attach_scroll.apply_total", total_started);
+    Ok(true)
 }
 
 fn apply_terminal_attach_input(
@@ -373,6 +631,7 @@ impl HeadlessServer {
             // If shutdown has been initiated, complete it and exit.
             if self.shutting_down {
                 self.complete_shutdown()?;
+                crate::render_prof::flush_now();
                 break;
             }
 
@@ -1286,6 +1545,8 @@ impl HeadlessServer {
         row: Option<u16>,
         modifiers: u8,
     ) -> bool {
+        let started = crate::render_prof::timer();
+        trace_server_attach_scroll_recv(client_id, &source, direction, lines);
         let Some(ClientConnection {
             mode: ClientConnectionMode::TerminalAttach { terminal_id },
             ..
@@ -1297,12 +1558,63 @@ impl HeadlessServer {
             return false;
         };
 
-        if let Err(err) =
-            apply_terminal_attach_scroll(runtime, source, direction, lines, column, row, modifiers)
-        {
-            warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach scroll failed");
+        let applied = match apply_terminal_attach_scroll(
+            client_id, runtime, source, direction, lines, column, row, modifiers,
+        ) {
+            Ok(applied) => applied,
+            Err(err) => {
+                warn!(client_id, terminal_id = %terminal_id, err = %err, "terminal attach scroll failed");
+                true
+            }
+        };
+        crate::render_prof::duration_since("server.attach_scroll.handle_total", started);
+        applied
+    }
+
+    fn runtime_for_terminal_attach_client(
+        &self,
+        client_id: u64,
+    ) -> Option<&crate::terminal::TerminalRuntime> {
+        let Some(ClientConnection {
+            mode: ClientConnectionMode::TerminalAttach { terminal_id },
+            ..
+        }) = self.clients.get(&client_id)
+        else {
+            return None;
+        };
+        self.runtime_for_terminal_id_string(terminal_id)
+    }
+
+    fn wheel_scroll_can_use_viewport_backpressure(&self, client_id: u64) -> bool {
+        self.runtime_for_terminal_attach_client(client_id)
+            .is_some_and(terminal_attach_scroll_uses_viewport)
+    }
+
+    fn pending_wheel_scroll_blocked_by_boundary(
+        &self,
+        pending: &PendingTerminalAttachWheelScroll,
+    ) -> bool {
+        self.runtime_for_terminal_attach_client(pending.client_id)
+            .is_some_and(|runtime| viewport_boundary_blocks_scroll(runtime, pending.direction))
+    }
+
+    fn apply_pending_terminal_attach_wheel_scroll(
+        &mut self,
+        pending: PendingTerminalAttachWheelScroll,
+    ) -> bool {
+        if self.pending_wheel_scroll_blocked_by_boundary(&pending) {
+            crate::render_prof::event("server.attach_scroll.drop_pending_boundary_wheel");
+            return false;
         }
-        true
+        self.handle_terminal_attach_scroll(
+            pending.client_id,
+            AttachScrollSource::Wheel,
+            pending.direction,
+            pending.lines,
+            pending.column,
+            pending.row,
+            pending.modifiers,
+        )
     }
 
     /// Coalesces only immediately queued terminal-attach scroll events.
@@ -1310,11 +1622,96 @@ impl HeadlessServer {
     /// The first non-scroll event is saved and processed by the normal event
     /// path on the next loop turn. This gives wheel bursts one render decision
     /// without using a generic pre-render drain or reordering lifecycle/resize/
-    /// attach/detach/shutdown/writer-drain events.
-    fn coalesce_pending_terminal_attach_scrolls(&mut self) -> usize {
+    /// attach/detach/shutdown/writer-drain events. Viewport wheel bursts are
+    /// reduced to the newest direction so stale inertial deltas cannot block an
+    /// opposite-direction reversal.
+    fn coalesce_terminal_attach_scrolls(
+        &mut self,
+        mut pending_wheel: Option<PendingTerminalAttachWheelScroll>,
+    ) -> usize {
         let mut coalesced = 0;
+        let started = crate::render_prof::timer();
         while let Ok(ev) = self.server_event_rx.try_recv() {
             match ev {
+                ServerEvent::ClientAttachScroll {
+                    client_id,
+                    source: AttachScrollSource::Wheel,
+                    direction,
+                    lines,
+                    column,
+                    row,
+                    modifiers,
+                } if self.wheel_scroll_can_use_viewport_backpressure(client_id) => {
+                    let incoming = PendingTerminalAttachWheelScroll {
+                        client_id,
+                        direction,
+                        lines,
+                        column,
+                        row,
+                        modifiers,
+                    };
+                    trace_server_attach_scroll_recv(
+                        client_id,
+                        &AttachScrollSource::Wheel,
+                        direction,
+                        lines,
+                    );
+                    match &mut pending_wheel {
+                        Some(pending)
+                            if pending.client_id == incoming.client_id
+                                && pending.direction == incoming.direction =>
+                        {
+                            let before = pending.clone();
+                            pending.add_lines(incoming.lines);
+                            trace_server_attach_scroll_coalesce(
+                                Some(&before),
+                                &incoming,
+                                "add",
+                                Some(pending),
+                            );
+                        }
+                        Some(pending)
+                            if pending.client_id == incoming.client_id
+                                && pending.direction != incoming.direction =>
+                        {
+                            crate::render_prof::event(
+                                "server.attach_scroll.cancel_reversed_pending",
+                            );
+                            let before = pending.clone();
+                            *pending = incoming;
+                            trace_server_attach_scroll_coalesce(
+                                Some(&before),
+                                pending,
+                                "cancel_reverse",
+                                Some(pending),
+                            );
+                        }
+                        Some(_) => {
+                            trace_server_attach_scroll_coalesce(
+                                pending_wheel.as_ref(),
+                                &incoming,
+                                "apply",
+                                Some(&incoming),
+                            );
+                            let pending = pending_wheel
+                                .take()
+                                .expect("pending wheel exists before client switch");
+                            if self.apply_pending_terminal_attach_wheel_scroll(pending) {
+                                coalesced += 1;
+                            }
+                            pending_wheel = Some(incoming);
+                        }
+                        None => {
+                            pending_wheel = Some(incoming);
+                            trace_server_attach_scroll_coalesce(
+                                None,
+                                pending_wheel.as_ref().expect("incoming pending set"),
+                                "add",
+                                pending_wheel.as_ref(),
+                            );
+                        }
+                    }
+                }
                 ServerEvent::ClientAttachScroll {
                     client_id,
                     source,
@@ -1324,6 +1721,11 @@ impl HeadlessServer {
                     row,
                     modifiers,
                 } => {
+                    if let Some(pending) = pending_wheel.take() {
+                        if self.apply_pending_terminal_attach_wheel_scroll(pending) {
+                            coalesced += 1;
+                        }
+                    }
                     if self.handle_terminal_attach_scroll(
                         client_id, source, direction, lines, column, row, modifiers,
                     ) {
@@ -1331,10 +1733,23 @@ impl HeadlessServer {
                     }
                 }
                 other => {
+                    if let Some(pending) = pending_wheel.take() {
+                        if self.apply_pending_terminal_attach_wheel_scroll(pending) {
+                            coalesced += 1;
+                        }
+                    }
                     self.pending_server_event = Some(other);
                     break;
                 }
             }
+        }
+        if let Some(pending) = pending_wheel.take() {
+            if self.apply_pending_terminal_attach_wheel_scroll(pending) {
+                coalesced += 1;
+            }
+        }
+        if coalesced > 0 {
+            crate::render_prof::duration_since("server.attach_scroll.coalesce_drain", started);
         }
         coalesced
     }
@@ -1948,15 +2363,53 @@ impl HeadlessServer {
                 row,
                 modifiers,
             } => {
-                let changed = self.handle_terminal_attach_scroll(
-                    client_id, source, direction, lines, column, row, modifiers,
-                );
-                let coalesced = self.coalesce_pending_terminal_attach_scrolls();
+                crate::render_prof::event("server.event.attach_scroll");
+                let render_already_pending = self
+                    .clients
+                    .get(&client_id)
+                    .map(|client| client.render_pending);
+                let first_is_viewport_wheel = matches!(source, AttachScrollSource::Wheel)
+                    && self.wheel_scroll_can_use_viewport_backpressure(client_id);
+                let changed = if first_is_viewport_wheel {
+                    false
+                } else {
+                    self.handle_terminal_attach_scroll(
+                        client_id, source, direction, lines, column, row, modifiers,
+                    )
+                };
+                let first_pending_wheel =
+                    first_is_viewport_wheel.then_some(PendingTerminalAttachWheelScroll {
+                        client_id,
+                        direction,
+                        lines,
+                        column,
+                        row,
+                        modifiers,
+                    });
+                let coalesced = self.coalesce_terminal_attach_scrolls(first_pending_wheel);
                 if coalesced > 0 {
                     crate::render_prof::counter(
                         "server.attach_scroll_events_coalesced",
                         coalesced as u64,
                     );
+                }
+                if changed || coalesced > 0 {
+                    crate::render_prof::event("server.render_schedule.attach_scroll");
+                    if crate::render_prof::enabled() {
+                        crate::render_prof::trace_event(
+                            "server.render_schedule.attach_scroll",
+                            &[
+                                ("coalesced_count", coalesced.to_string()),
+                                ("changed", changed.to_string()),
+                                (
+                                    "render_already_pending",
+                                    crate::render_prof::trace_opt(render_already_pending),
+                                ),
+                                ("inflight", "null".to_owned()),
+                                ("reason", crate::render_prof::trace_string("attach_scroll")),
+                            ],
+                        );
+                    }
                 }
                 changed || coalesced > 0
             }
@@ -2139,17 +2592,6 @@ impl HeadlessServer {
                 self.remove_client_and_resize_if_needed(client_id);
                 true
             }
-            ServerEvent::ClientWriterDrained { client_id } => {
-                let Some(client) = self.clients.get_mut(&client_id) else {
-                    return false;
-                };
-                if client.render_pending {
-                    client.render_pending = false;
-                    true
-                } else {
-                    false
-                }
-            }
             ServerEvent::QuitSignal => {
                 // The quit check at the top of the loop handles this.
                 // No render needed — the next iteration will initiate shutdown.
@@ -2163,7 +2605,6 @@ impl HeadlessServer {
             ev,
             ServerEvent::ClientConnected { .. }
                 | ServerEvent::ClientDisconnected { .. }
-                | ServerEvent::ClientWriterDrained { .. }
                 | ServerEvent::QuitSignal
         )
     }
@@ -2678,6 +3119,7 @@ impl HeadlessServer {
     }
 
     fn render_and_stream(&mut self) {
+        crate::render_prof::event("server.render_attempt");
         let full_started = crate::render_prof::timer();
         let render_targets = render_targets(&self.clients, self.foreground_client_id);
 
@@ -3408,8 +3850,12 @@ fn init_logging() {
 mod tests {
     use super::*;
 
+    use std::io::Write;
+    use std::net::Shutdown;
+    use std::os::unix::net::UnixStream;
+
     use crate::app::AppState;
-    use crate::protocol::CursorState;
+    use crate::protocol::{ClientKeybindings, ClientLaunchMode, ClientMessage, CursorState};
 
     fn test_headless_server() -> HeadlessServer {
         let config = crate::config::Config::default();
@@ -3532,6 +3978,20 @@ mod tests {
             Some(expected_version.as_str())
         );
         assert!(server.app.event_rx.try_recv().is_err());
+    }
+
+    fn drain_one_server_event_until(server: &mut HeadlessServer, label: &str) {
+        let deadline = Instant::now() + Duration::from_millis(250);
+        loop {
+            if server.drain_server_events() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for server event: {label}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     fn test_client_writer() -> (
@@ -4072,6 +4532,7 @@ next_tab = ""
             crate::terminal::TerminalRuntime::test_with_scrollback_bytes(20, 5, 4096, &bytes);
 
         apply_terminal_attach_scroll(
+            0,
             &runtime,
             AttachScrollSource::Wheel,
             AttachScrollDirection::Up,
@@ -4085,6 +4546,7 @@ next_tab = ""
         assert_eq!(metrics.offset_from_bottom, 3);
 
         apply_terminal_attach_scroll(
+            0,
             &runtime,
             AttachScrollSource::Wheel,
             AttachScrollDirection::Down,
@@ -4120,6 +4582,49 @@ next_tab = ""
         }
         let runtime =
             crate::terminal::TerminalRuntime::test_with_scrollback_bytes(20, 5, 4096, &bytes);
+        server
+            .app
+            .terminal_runtimes
+            .insert(terminal_id.clone(), runtime);
+        let terminal_id = terminal_id.to_string();
+        let (writer, _control_rx, _render_rx) = test_client_writer();
+
+        assert!(server.handle_server_event(ServerEvent::ClientConnected {
+            client_id: 7,
+            cols: 20,
+            rows: 5,
+            cell_width_px: 0,
+            cell_height_px: 0,
+            render_encoding: RenderEncoding::TerminalAnsi,
+            keybindings: None,
+            direct_attach_requested: true,
+            writer,
+        }));
+        assert!(
+            server.handle_server_event(ServerEvent::ClientAttachTerminal {
+                client_id: 7,
+                terminal_id: terminal_id.clone(),
+                takeover: false,
+            })
+        );
+
+        (server, terminal_id)
+    }
+
+    fn terminal_attach_scroll_server_with_runtime(
+        runtime: crate::terminal::TerminalRuntime,
+    ) -> (HeadlessServer, String) {
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("scroll-routing");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace
+            .pane_state(pane_id)
+            .expect("pane")
+            .attached_terminal_id
+            .clone();
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.ensure_test_terminals();
         server
             .app
             .terminal_runtimes
@@ -4191,6 +4696,808 @@ next_tab = ""
             .scroll_metrics()
             .expect("scroll metrics");
         assert_eq!(metrics.offset_from_bottom, 64);
+
+        drop(_runtime_guard);
+        rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn terminal_attach_scroll_boundary_overscroll_reports_no_render_until_reversal() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _runtime_guard = rt.enter();
+        let (mut server, terminal_id) = terminal_attach_scroll_server();
+
+        let changed = server.handle_server_event(ServerEvent::ClientAttachScroll {
+            client_id: 7,
+            source: AttachScrollSource::Wheel,
+            direction: AttachScrollDirection::Down,
+            lines: 1,
+            column: None,
+            row: None,
+            modifiers: 0,
+        });
+        assert!(
+            !changed,
+            "bottom boundary overscroll must not schedule a render"
+        );
+        assert_eq!(
+            server
+                .runtime_for_terminal_id_string(&terminal_id)
+                .expect("attached runtime")
+                .scroll_metrics()
+                .expect("scroll metrics")
+                .offset_from_bottom,
+            0
+        );
+
+        let changed = server.handle_server_event(ServerEvent::ClientAttachScroll {
+            client_id: 7,
+            source: AttachScrollSource::Wheel,
+            direction: AttachScrollDirection::Up,
+            lines: 2,
+            column: None,
+            row: None,
+            modifiers: 0,
+        });
+        assert!(changed, "opposite scroll after bottom drop must render");
+        assert_eq!(
+            server
+                .runtime_for_terminal_id_string(&terminal_id)
+                .expect("attached runtime")
+                .scroll_metrics()
+                .expect("scroll metrics")
+                .offset_from_bottom,
+            2
+        );
+
+        let max_offset = server
+            .runtime_for_terminal_id_string(&terminal_id)
+            .expect("attached runtime")
+            .scroll_metrics()
+            .expect("scroll metrics")
+            .max_offset_from_bottom;
+        server
+            .runtime_for_terminal_id_string(&terminal_id)
+            .expect("attached runtime")
+            .scroll_up(max_offset as usize);
+        let changed = server.handle_server_event(ServerEvent::ClientAttachScroll {
+            client_id: 7,
+            source: AttachScrollSource::Wheel,
+            direction: AttachScrollDirection::Up,
+            lines: 1,
+            column: None,
+            row: None,
+            modifiers: 0,
+        });
+        assert!(
+            !changed,
+            "top boundary overscroll must not schedule a render"
+        );
+
+        let changed = server.handle_server_event(ServerEvent::ClientAttachScroll {
+            client_id: 7,
+            source: AttachScrollSource::Wheel,
+            direction: AttachScrollDirection::Down,
+            lines: 3,
+            column: None,
+            row: None,
+            modifiers: 0,
+        });
+        assert!(changed, "opposite scroll after top drop must render");
+        assert_eq!(
+            server
+                .runtime_for_terminal_id_string(&terminal_id)
+                .expect("attached runtime")
+                .scroll_metrics()
+                .expect("scroll metrics")
+                .offset_from_bottom,
+            max_offset.saturating_sub(3)
+        );
+
+        drop(_runtime_guard);
+        rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn terminal_attach_scroll_drops_bottom_overscroll_before_reversal() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _runtime_guard = rt.enter();
+        let (mut server, terminal_id) = terminal_attach_scroll_server();
+
+        for _ in 0..32 {
+            server
+                .server_event_tx
+                .try_send(ServerEvent::ClientAttachScroll {
+                    client_id: 7,
+                    source: AttachScrollSource::Wheel,
+                    direction: AttachScrollDirection::Down,
+                    lines: 1,
+                    column: None,
+                    row: None,
+                    modifiers: 0,
+                })
+                .expect("queue stale bottom overscroll");
+        }
+        server
+            .server_event_tx
+            .try_send(ServerEvent::ClientAttachScroll {
+                client_id: 7,
+                source: AttachScrollSource::Wheel,
+                direction: AttachScrollDirection::Up,
+                lines: 2,
+                column: None,
+                row: None,
+                modifiers: 0,
+            })
+            .expect("queue reversal up");
+
+        assert!(server.drain_server_events());
+        let metrics = server
+            .runtime_for_terminal_id_string(&terminal_id)
+            .expect("attached runtime")
+            .scroll_metrics()
+            .expect("scroll metrics");
+        assert_eq!(
+            metrics.offset_from_bottom, 2,
+            "bottom overscroll backlog must not delay the first opposite scroll"
+        );
+        assert!(!server.drain_server_events());
+
+        drop(_runtime_guard);
+        rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn terminal_attach_scroll_hard_reversal_cancels_first_viewport_wheel() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _runtime_guard = rt.enter();
+        let (mut server, terminal_id) = terminal_attach_scroll_server();
+        server
+            .runtime_for_terminal_id_string(&terminal_id)
+            .expect("attached runtime")
+            .scroll_up(20);
+
+        server
+            .server_event_tx
+            .try_send(ServerEvent::ClientAttachScroll {
+                client_id: 7,
+                source: AttachScrollSource::Wheel,
+                direction: AttachScrollDirection::Down,
+                lines: 100,
+                column: None,
+                row: None,
+                modifiers: 0,
+            })
+            .expect("queue stale down wheel");
+        server
+            .server_event_tx
+            .try_send(ServerEvent::ClientAttachScroll {
+                client_id: 7,
+                source: AttachScrollSource::Wheel,
+                direction: AttachScrollDirection::Up,
+                lines: 1,
+                column: None,
+                row: None,
+                modifiers: 0,
+            })
+            .expect("queue fresh up reversal");
+
+        assert!(server.drain_server_events());
+        let metrics = server
+            .runtime_for_terminal_id_string(&terminal_id)
+            .expect("attached runtime")
+            .scroll_metrics()
+            .expect("scroll metrics");
+        assert_eq!(
+            metrics.offset_from_bottom, 21,
+            "hard reversal must replace the first stale wheel instead of applying down-100 first"
+        );
+        assert!(!server.drain_server_events());
+
+        drop(_runtime_guard);
+        rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn terminal_attach_scroll_coalescing_cancels_double_inertial_reversal() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _runtime_guard = rt.enter();
+        let (mut server, terminal_id) = terminal_attach_scroll_server();
+        server
+            .runtime_for_terminal_id_string(&terminal_id)
+            .expect("attached runtime")
+            .scroll_up(20);
+
+        for _ in 0..12 {
+            server
+                .server_event_tx
+                .try_send(ServerEvent::ClientAttachScroll {
+                    client_id: 7,
+                    source: AttachScrollSource::Wheel,
+                    direction: AttachScrollDirection::Up,
+                    lines: 1,
+                    column: None,
+                    row: None,
+                    modifiers: 0,
+                })
+                .expect("queue upward inertia");
+        }
+        for _ in 0..5 {
+            server
+                .server_event_tx
+                .try_send(ServerEvent::ClientAttachScroll {
+                    client_id: 7,
+                    source: AttachScrollSource::Wheel,
+                    direction: AttachScrollDirection::Down,
+                    lines: 1,
+                    column: None,
+                    row: None,
+                    modifiers: 0,
+                })
+                .expect("queue downward reversal");
+        }
+        for _ in 0..3 {
+            server
+                .server_event_tx
+                .try_send(ServerEvent::ClientAttachScroll {
+                    client_id: 7,
+                    source: AttachScrollSource::Wheel,
+                    direction: AttachScrollDirection::Up,
+                    lines: 1,
+                    column: None,
+                    row: None,
+                    modifiers: 0,
+                })
+                .expect("queue second upward reversal");
+        }
+
+        assert!(server.drain_server_events());
+        let metrics = server
+            .runtime_for_terminal_id_string(&terminal_id)
+            .expect("attached runtime")
+            .scroll_metrics()
+            .expect("scroll metrics");
+        assert_eq!(
+            metrics.offset_from_bottom, 23,
+            "queued opposite flicks should collapse to the newest direction including the first event"
+        );
+        assert!(!server.drain_server_events());
+
+        drop(_runtime_guard);
+        rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn terminal_attach_inertial_scroll_trace_reports_pipeline_metrics() {
+        let _profiler_guard = crate::render_prof::enable_for_test();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _runtime_guard = rt.enter();
+
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("inertial-scroll");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace
+            .pane_state(pane_id)
+            .expect("pane")
+            .attached_terminal_id
+            .clone();
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.ensure_test_terminals();
+
+        let mut bytes = Vec::new();
+        for line in 0..8_000 {
+            bytes.extend_from_slice(format!("history line {line:04}\r\n").as_bytes());
+        }
+        let runtime =
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(80, 24, 1_000_000, &bytes);
+        server
+            .app
+            .terminal_runtimes
+            .insert(terminal_id.clone(), runtime);
+        let terminal_id = terminal_id.to_string();
+
+        let (mut client_stream, server_stream) = UnixStream::pair().expect("client socket pair");
+        let server_event_tx = server.server_event_tx.clone();
+        let should_quit = server.should_quit.clone();
+        let client_thread = std::thread::spawn(move || {
+            crate::server::client_transport::handle_client_handshake(
+                server_stream,
+                7,
+                &server_event_tx,
+                &should_quit,
+            )
+        });
+
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::Hello {
+                version: protocol::PROTOCOL_VERSION,
+                cols: 80,
+                rows: 24,
+                cell_width_px: 8,
+                cell_height_px: 16,
+                requested_encoding: RenderEncoding::TerminalAnsi,
+                keybindings: ClientKeybindings::Server,
+                launch_mode: ClientLaunchMode::TerminalAttach,
+            },
+        )
+        .expect("write client hello");
+        let welcome: ServerMessage =
+            protocol::read_message(&mut client_stream, MAX_FRAME_SIZE).expect("read welcome");
+        assert!(matches!(
+            welcome,
+            ServerMessage::Welcome { error: None, .. }
+        ));
+        drain_one_server_event_until(&mut server, "client connected");
+
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::AttachTerminal {
+                terminal_id: terminal_id.clone(),
+                takeover: false,
+            },
+        )
+        .expect("write attach terminal");
+        drain_one_server_event_until(&mut server, "attach terminal");
+
+        server.render_and_stream();
+        let warm_frame: ServerMessage =
+            protocol::read_message(&mut client_stream, MAX_GRAPHICS_FRAME_SIZE)
+                .expect("warm initial attach frame");
+        assert!(
+            matches!(
+                warm_frame,
+                ServerMessage::Frame(_) | ServerMessage::Terminal(_)
+            ),
+            "expected warm terminal frame, got {warm_frame:?}"
+        );
+        crate::render_prof::reset_profiler_for_tests();
+
+        let mut chunks = Vec::new();
+        let mut raw_wheel_events = 0usize;
+        // 64 ticks at ~16ms each: slow start, acceleration, peak, deceleration/stop.
+        for tick in 0..64usize {
+            let per_tick = if tick < 16 {
+                1 + tick / 4
+            } else if tick < 32 {
+                5 + (tick - 16) / 3
+            } else if tick < 48 {
+                10usize.saturating_sub((tick - 32) / 3)
+            } else {
+                4usize.saturating_sub((tick - 48) / 4)
+            }
+            .max(1);
+            raw_wheel_events += per_tick;
+            let mut chunk = Vec::new();
+            for _ in 0..per_tick {
+                chunk.extend_from_slice(b"\x1b[<64;40;12M");
+            }
+            chunks.push(chunk);
+        }
+
+        let write_stats = crate::client::write_direct_attach_wheel_chunks_for_test(
+            &mut client_stream,
+            &chunks,
+            24,
+            3,
+            Duration::from_millis(64),
+            Instant::now(),
+        )
+        .expect("write raw inertial wheel chunks through client framing");
+        assert_eq!(
+            write_stats.emitted_scroll_lines,
+            raw_wheel_events * 3,
+            "client diagnostics must prove every raw wheel packet became one scroll quantum"
+        );
+        assert!(
+            write_stats.emitted_messages > 0,
+            "client coalescer should emit at least one diagnostics message"
+        );
+        assert!(
+            write_stats.emitted_messages <= chunks.len() + 1,
+            "client coalescer should bound emitted messages to frame-ish cadence, got {} messages for {} chunks",
+            write_stats.emitted_messages,
+            chunks.len()
+        );
+        assert!(
+            write_stats.emitted_messages < raw_wheel_events,
+            "client coalescer should reduce raw inertial wheel events"
+        );
+        let emitted_message_count = write_stats.emitted_messages;
+        let emitted_scroll_lines = write_stats.emitted_scroll_lines;
+        client_stream
+            .shutdown(Shutdown::Write)
+            .expect("close client write side after diagnostics frames");
+        client_thread
+            .join()
+            .expect("client reader thread should not panic")
+            .expect("client reader thread should finish cleanly");
+
+        let mut render_decisions = 0;
+        drain_one_server_event_until(&mut server, "first inertial scroll");
+        render_decisions += 1;
+        server.render_and_stream();
+
+        let metrics = server
+            .runtime_for_terminal_id_string(&terminal_id)
+            .expect("attached runtime")
+            .scroll_metrics()
+            .expect("scroll metrics");
+        assert_eq!(metrics.offset_from_bottom, emitted_scroll_lines);
+        assert_eq!(
+            render_decisions, 1,
+            "server coalescing should bound render decisions for one inertial burst"
+        );
+        let rendered: ServerMessage =
+            protocol::read_message(&mut client_stream, MAX_GRAPHICS_FRAME_SIZE)
+                .expect("inertial burst should produce one rendered frame");
+        assert!(
+            matches!(
+                rendered,
+                ServerMessage::Frame(_) | ServerMessage::Terminal(_)
+            ),
+            "expected rendered terminal frame, got {rendered:?}"
+        );
+        client_stream
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .expect("set bounded frame read timeout");
+        let extra_frame: Result<ServerMessage, _> =
+            protocol::read_message(&mut client_stream, MAX_GRAPHICS_FRAME_SIZE);
+        assert!(
+            extra_frame.is_err(),
+            "render sends should be bounded after coalescing"
+        );
+
+        let top_ranked_duration = crate::render_prof::top_duration_name_for_tests()
+            .expect("diagnostics should record ranked durations");
+        let top_duration = crate::render_prof::top_actionable_leaf_duration_name_for_tests()
+            .expect("diagnostics should record actionable leaf durations");
+        let candidate_hypothesis = format!(
+            "1_{top_duration}_is_top_ranked_post_coalescing_cost_for_direct_attach_scrollback"
+        );
+        let summary = crate::render_prof::summary_for_tests();
+        println!(
+            "inertial scroll diagnostics baseline\n\
+raw_wheel_events={raw_wheel_events}\n\
+emitted_messages={emitted_message_count}\n\
+emitted_scroll_lines={emitted_scroll_lines}\n\
+render_decisions={render_decisions}\n\
+protocol_path_gap=uses_in_process_unix_stream_pair_and_handle_client_handshake;_does_not_cover_listener_accept_or_tui_client_reader_loop\n\
+exact_success_metric=keep_candidate_only_if_same_test_preserves_raw_to_message_coalescing_render_decisions_viewport_offset_and_reduces_the_target_ranked_duration_by_at_least_15_percent_without_increasing_full_render.total_or_server.attach_scroll.coalesce_drain_by_more_than_10_percent\n\
+rollback_point=diagnostics_baseline_worktree_before_candidate_patch;_rollback_candidate_with_git_restore_or_reverse_patch_if_metric_fails\n\
+candidate_hypotheses={candidate_hypothesis};_2_next_ranked_duration_is_secondary_and_should_only_be_optimized_after_top_rank_improves;_3_lower_ranked_stages_should_rise_before_becoming_candidate_targets\n\
+{summary}"
+        );
+        assert!(summary.contains("durations ranked by total cost:"));
+        assert!(summary.contains(&format!("  1. {top_ranked_duration}: count=")));
+        assert!(candidate_hypothesis.contains(top_duration));
+        assert_ne!(
+            top_duration, "full_render.total",
+            "candidate hypothesis must target actionable leaf stages, not aggregate timers"
+        );
+        assert!(summary.contains("count="));
+        assert!(summary.contains("avg_us="));
+        assert!(summary.contains("p50_us="));
+        assert!(summary.contains("p95_us="));
+        assert!(summary.contains("p99_us="));
+        assert!(summary.contains("max_us="));
+        assert!(summary.contains("server.attach_scroll.viewport_apply"));
+        assert!(summary.contains("full_render.render_terminal_virtual"));
+        assert!(summary.contains("prepare_frame.ansi.encode"));
+
+        drop(_runtime_guard);
+        rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    struct SlowOutputWriter {
+        bytes: usize,
+        writes: usize,
+        flushes: usize,
+        sleep_per_write: Duration,
+        sleep_per_flush: Duration,
+    }
+
+    impl SlowOutputWriter {
+        fn new(sleep_per_write: Duration, sleep_per_flush: Duration) -> Self {
+            Self {
+                bytes: 0,
+                writes: 0,
+                flushes: 0,
+                sleep_per_write,
+                sleep_per_flush,
+            }
+        }
+    }
+
+    impl Write for SlowOutputWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.bytes += buf.len();
+            self.writes += 1;
+            if !self.sleep_per_write.is_zero() {
+                std::thread::sleep(self.sleep_per_write);
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushes += 1;
+            if !self.sleep_per_flush.is_zero() {
+                std::thread::sleep(self.sleep_per_flush);
+            }
+            Ok(())
+        }
+    }
+
+    fn write_terminal_message_to_output_for_test(
+        msg: ServerMessage,
+        output: &mut impl Write,
+    ) -> io::Result<usize> {
+        match msg {
+            ServerMessage::Terminal(frame) => {
+                let len = frame.bytes.len();
+                let started = crate::render_prof::timer();
+                output.write_all(&frame.bytes)?;
+                output.flush()?;
+                let write_us = started.map(|started| started.elapsed().as_micros());
+                crate::render_prof::counter("client.output.terminal_bytes", len as u64);
+                crate::render_prof::event("client.output.terminal_frame");
+                crate::render_prof::duration_since("client.output.terminal_write_flush", started);
+                crate::render_prof::trace_event(
+                    "client.frame.recv_write",
+                    &[
+                        ("kind", crate::render_prof::trace_string("terminal")),
+                        ("frame_seq", frame.seq.to_string()),
+                        ("bytes", len.to_string()),
+                        ("age_ms", "null".to_owned()),
+                        ("write_us", crate::render_prof::trace_opt(write_us)),
+                    ],
+                );
+                Ok(len)
+            }
+            ServerMessage::Frame(frame) => {
+                let cells = frame.cells.len();
+                let started = crate::render_prof::timer();
+                output.flush()?;
+                crate::render_prof::counter("client.output.semantic_cells", cells as u64);
+                crate::render_prof::event("client.output.semantic_frame_seen_without_blit");
+                crate::render_prof::duration_since("client.output.semantic_flush", started);
+                Ok(0)
+            }
+            other => panic!("expected rendered terminal output frame, got {other:?}"),
+        }
+    }
+
+    fn inertial_scroll_chunks(ticks: usize) -> (Vec<Vec<u8>>, usize) {
+        let mut chunks = Vec::new();
+        let mut raw_wheel_events = 0usize;
+        for tick in 0..ticks {
+            let per_tick = if tick < ticks / 4 {
+                1 + tick / 4
+            } else if tick < ticks / 2 {
+                5 + (tick - ticks / 4) / 3
+            } else if tick < ticks * 3 / 4 {
+                10usize.saturating_sub((tick - ticks / 2) / 3)
+            } else {
+                4usize.saturating_sub((tick - ticks * 3 / 4) / 4)
+            }
+            .max(1);
+            raw_wheel_events += per_tick;
+            let mut chunk = Vec::new();
+            for _ in 0..per_tick {
+                chunk.extend_from_slice(b"\x1b[<64;40;12M");
+            }
+            chunks.push(chunk);
+        }
+        (chunks, raw_wheel_events)
+    }
+
+    #[test]
+    fn terminal_attach_double_inertial_scroll_trace_covers_client_output_pressure() {
+        let _profiler_guard = crate::render_prof::enable_for_test();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _runtime_guard = rt.enter();
+
+        let mut server = test_headless_server();
+        let workspace = crate::workspace::Workspace::test_new("double-inertial-scroll");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace
+            .pane_state(pane_id)
+            .expect("pane")
+            .attached_terminal_id
+            .clone();
+        server.app.state.workspaces = vec![workspace];
+        server.app.state.active = Some(0);
+        server.app.state.ensure_test_terminals();
+
+        let mut bytes = Vec::new();
+        for line in 0..8_000 {
+            bytes.extend_from_slice(format!("history line {line:04}\r\n").as_bytes());
+        }
+        let runtime =
+            crate::terminal::TerminalRuntime::test_with_scrollback_bytes(80, 24, 1_000_000, &bytes);
+        server
+            .app
+            .terminal_runtimes
+            .insert(terminal_id.clone(), runtime);
+        let terminal_id = terminal_id.to_string();
+
+        let (mut client_stream, server_stream) = UnixStream::pair().expect("client socket pair");
+        let server_event_tx = server.server_event_tx.clone();
+        let should_quit = server.should_quit.clone();
+        let client_thread = std::thread::spawn(move || {
+            crate::server::client_transport::handle_client_handshake(
+                server_stream,
+                7,
+                &server_event_tx,
+                &should_quit,
+            )
+        });
+
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::Hello {
+                version: protocol::PROTOCOL_VERSION,
+                cols: 80,
+                rows: 24,
+                cell_width_px: 8,
+                cell_height_px: 16,
+                requested_encoding: RenderEncoding::TerminalAnsi,
+                keybindings: ClientKeybindings::Server,
+                launch_mode: ClientLaunchMode::TerminalAttach,
+            },
+        )
+        .expect("write client hello");
+        let welcome: ServerMessage =
+            protocol::read_message(&mut client_stream, MAX_FRAME_SIZE).expect("read welcome");
+        assert!(matches!(
+            welcome,
+            ServerMessage::Welcome { error: None, .. }
+        ));
+        drain_one_server_event_until(&mut server, "client connected");
+
+        protocol::write_message(
+            &mut client_stream,
+            &ClientMessage::AttachTerminal {
+                terminal_id: terminal_id.clone(),
+                takeover: false,
+            },
+        )
+        .expect("write attach terminal");
+        drain_one_server_event_until(&mut server, "attach terminal");
+
+        server.render_and_stream();
+        let warm_frame: ServerMessage =
+            protocol::read_message(&mut client_stream, MAX_GRAPHICS_FRAME_SIZE)
+                .expect("warm initial attach frame");
+        assert!(matches!(warm_frame, ServerMessage::Terminal(_)));
+        crate::render_prof::reset_profiler_for_tests();
+
+        let (first_chunks, first_raw_wheel_events) = inertial_scroll_chunks(32);
+        let (second_chunks, second_raw_wheel_events) = inertial_scroll_chunks(32);
+        let first_write_stats = crate::client::write_direct_attach_wheel_chunks_for_test(
+            &mut client_stream,
+            &first_chunks,
+            24,
+            3,
+            Duration::from_millis(64),
+            Instant::now(),
+        )
+        .expect("write first inertial flick");
+        std::thread::sleep(Duration::from_millis(20));
+
+        let mut render_decisions = 0usize;
+        drain_one_server_event_until(&mut server, "first inertial scroll");
+        render_decisions += 1;
+        server.render_and_stream();
+
+        let mut output = SlowOutputWriter::new(Duration::from_millis(0), Duration::from_millis(24));
+        let first_client_output_started = Instant::now();
+        let first_rendered: ServerMessage =
+            protocol::read_message(&mut client_stream, MAX_GRAPHICS_FRAME_SIZE)
+                .expect("first inertial frame");
+        let first_output_bytes =
+            write_terminal_message_to_output_for_test(first_rendered, &mut output)
+                .expect("slow first client output write");
+        let first_output_ms = first_client_output_started.elapsed().as_millis();
+
+        std::thread::sleep(Duration::from_millis(48));
+        let second_write_started = Instant::now();
+        let second_write_stats = crate::client::write_direct_attach_wheel_chunks_for_test(
+            &mut client_stream,
+            &second_chunks,
+            24,
+            3,
+            Duration::from_millis(64),
+            second_write_started,
+        )
+        .expect("write second inertial flick after short pause");
+        std::thread::sleep(Duration::from_millis(20));
+        let second_input_to_render_started = Instant::now();
+        drain_one_server_event_until(&mut server, "second inertial scroll");
+        render_decisions += 1;
+        server.render_and_stream();
+
+        let second_rendered: ServerMessage =
+            protocol::read_message(&mut client_stream, MAX_GRAPHICS_FRAME_SIZE)
+                .expect("second inertial frame");
+        let second_output_bytes =
+            write_terminal_message_to_output_for_test(second_rendered, &mut output)
+                .expect("slow second client output write");
+        let second_input_to_output_ms = second_input_to_render_started.elapsed().as_millis();
+
+        let total_emitted_lines =
+            first_write_stats.emitted_scroll_lines + second_write_stats.emitted_scroll_lines;
+        let metrics = server
+            .runtime_for_terminal_id_string(&terminal_id)
+            .expect("attached runtime")
+            .scroll_metrics()
+            .expect("scroll metrics");
+        assert_eq!(metrics.offset_from_bottom, total_emitted_lines);
+        assert_eq!(
+            render_decisions, 2,
+            "two flicks should render once per burst"
+        );
+        assert!(first_output_bytes > 0);
+        assert!(second_output_bytes > 0);
+
+        client_stream
+            .shutdown(Shutdown::Write)
+            .expect("close client write side after diagnostics frames");
+        client_thread
+            .join()
+            .expect("client reader thread should not panic")
+            .expect("client reader thread should finish cleanly");
+
+        let summary = crate::render_prof::summary_for_tests();
+        println!(
+            "double inertial scroll diagnostics\n\
+first_raw_wheel_events={first_raw_wheel_events}\n\
+second_raw_wheel_events={second_raw_wheel_events}\n\
+first_emitted_messages={}\n\
+second_emitted_messages={}\n\
+first_emitted_scroll_lines={}\n\
+second_emitted_scroll_lines={}\n\
+render_decisions={render_decisions}\n\
+final_offset_from_bottom={}\n\
+client_output_frames={}\n\
+client_output_bytes={}\n\
+client_output_flushes={}\n\
+first_output_ms={first_output_ms}\n\
+second_input_to_output_ms={second_input_to_output_ms}\n\
+scenario_gap=still_in_process_socket_pair_but_now_runs_two_release_separated_inertial_bursts_and_writes_received_terminal_frames_to_a_slow_stdout_fixture\n\
+writer_timing_note=server.client_writer.render_write_flush_records_socket_write_flush_without_event_loop_feedback\n\
+{summary}",
+            first_write_stats.emitted_messages,
+            second_write_stats.emitted_messages,
+            first_write_stats.emitted_scroll_lines,
+            second_write_stats.emitted_scroll_lines,
+            metrics.offset_from_bottom,
+            output.writes,
+            output.bytes,
+            output.flushes,
+        );
+        assert!(summary.contains("client.output.terminal_write_flush"));
+        assert!(summary.contains("server.client_writer.render_write_flush"));
+        assert!(summary.contains("server.client_writer.render_recv"));
 
         drop(_runtime_guard);
         rt.shutdown_timeout(Duration::from_millis(100));
@@ -4334,6 +5641,7 @@ next_tab = ""
             );
 
         apply_terminal_attach_scroll(
+            0,
             &runtime,
             AttachScrollSource::PageKey {
                 input: b"\x1b[5~".to_vec(),
@@ -4377,6 +5685,7 @@ next_tab = ""
         runtime.scroll_up(3);
 
         apply_terminal_attach_scroll(
+            0,
             &runtime,
             AttachScrollSource::PageKey {
                 input: b"\x1b[5~".to_vec(),
@@ -4423,6 +5732,7 @@ next_tab = ""
         );
 
         apply_terminal_attach_scroll(
+            0,
             &runtime,
             AttachScrollSource::Wheel,
             AttachScrollDirection::Up,
@@ -4451,6 +5761,66 @@ next_tab = ""
     }
 
     #[test]
+    fn terminal_attach_reversal_replays_pending_mouse_report_events() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _runtime_guard = rt.enter();
+        let bytes = b"\x1b[?1000h\x1b[?1006hready\r\n";
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                20, 5, 4096, bytes, 4,
+            );
+        assert_eq!(
+            runtime.wheel_routing(),
+            Some(crate::pane::WheelRouting::MouseReport)
+        );
+        let (mut server, _terminal_id) = terminal_attach_scroll_server_with_runtime(runtime);
+
+        server
+            .server_event_tx
+            .try_send(ServerEvent::ClientAttachScroll {
+                client_id: 7,
+                source: AttachScrollSource::Wheel,
+                direction: AttachScrollDirection::Up,
+                lines: 3,
+                column: Some(10),
+                row: Some(4),
+                modifiers: KeyModifiers::CONTROL.bits(),
+            })
+            .expect("queue pending mouse-report scroll");
+        server
+            .server_event_tx
+            .try_send(ServerEvent::ClientAttachScroll {
+                client_id: 7,
+                source: AttachScrollSource::Wheel,
+                direction: AttachScrollDirection::Down,
+                lines: 2,
+                column: Some(10),
+                row: Some(4),
+                modifiers: KeyModifiers::CONTROL.bits(),
+            })
+            .expect("queue reversed mouse-report scroll");
+
+        assert!(server.drain_server_events());
+
+        let up = input_rx
+            .try_recv()
+            .expect("forwarded pending mouse reports");
+        let down = input_rx
+            .try_recv()
+            .expect("forwarded reversed mouse reports");
+        assert_eq!(up.len() % 3, 0);
+        assert_eq!(down.len() % 2, 0);
+        assert_ne!(up, down, "opposite mouse wheel directions must both replay");
+        assert!(input_rx.try_recv().is_err());
+
+        drop(_runtime_guard);
+        rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    #[test]
     fn terminal_attach_coalesced_wheel_replays_alternate_scroll_events() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -4468,6 +5838,7 @@ next_tab = ""
         );
 
         apply_terminal_attach_scroll(
+            0,
             &runtime,
             AttachScrollSource::Wheel,
             AttachScrollDirection::Down,
@@ -4492,6 +5863,69 @@ next_tab = ""
         }
 
         drop(runtime);
+        drop(_runtime_guard);
+        rt.shutdown_timeout(Duration::from_millis(100));
+    }
+
+    #[test]
+    fn terminal_attach_reversal_replays_pending_alternate_scroll_events() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let _runtime_guard = rt.enter();
+        let bytes = b"\x1b[?1007h\x1b[?1049halternate\r\n";
+        let (runtime, mut input_rx) =
+            crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                20, 5, 4096, bytes, 4,
+            );
+        assert_eq!(
+            runtime.wheel_routing(),
+            Some(crate::pane::WheelRouting::AlternateScroll)
+        );
+        let (mut server, _terminal_id) = terminal_attach_scroll_server_with_runtime(runtime);
+
+        server
+            .server_event_tx
+            .try_send(ServerEvent::ClientAttachScroll {
+                client_id: 7,
+                source: AttachScrollSource::Wheel,
+                direction: AttachScrollDirection::Up,
+                lines: 4,
+                column: None,
+                row: None,
+                modifiers: 0,
+            })
+            .expect("queue pending alternate scroll");
+        server
+            .server_event_tx
+            .try_send(ServerEvent::ClientAttachScroll {
+                client_id: 7,
+                source: AttachScrollSource::Wheel,
+                direction: AttachScrollDirection::Down,
+                lines: 2,
+                column: None,
+                row: None,
+                modifiers: 0,
+            })
+            .expect("queue reversed alternate scroll");
+
+        assert!(server.drain_server_events());
+
+        let up = input_rx
+            .try_recv()
+            .expect("forwarded pending alternate scroll");
+        let down = input_rx
+            .try_recv()
+            .expect("forwarded reversed alternate scroll");
+        assert_eq!(up.len() % 4, 0);
+        assert_eq!(down.len() % 2, 0);
+        assert_ne!(
+            up, down,
+            "opposite alternate-scroll directions must both replay"
+        );
+        assert!(input_rx.try_recv().is_err());
+
         drop(_runtime_guard);
         rt.shutdown_timeout(Duration::from_millis(100));
     }
@@ -5833,7 +7267,6 @@ next_tab = ""
             ServerMessage::ReloadSoundConfig
         ));
 
-        assert!(server.handle_server_event(ServerEvent::ClientWriterDrained { client_id: 1 }));
         server.render_and_stream();
 
         match read_server_message(client_rx.recv_timeout(Duration::from_millis(100)).unwrap()) {

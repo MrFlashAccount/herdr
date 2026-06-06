@@ -65,6 +65,8 @@ struct ClientState {
     redraw_on_focus_gained: bool,
     /// Frame-budget coalescer for direct-attach wheel scroll bursts.
     attach_wheel_scroll: AttachWheelScrollCoalescer,
+    /// Local trace sequence for frames received from the server.
+    trace_frame_seq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +106,7 @@ impl PendingAttachWheelScroll {
 struct AttachWheelScrollCoalescer {
     pending: Option<PendingAttachWheelScroll>,
     last_emit_at: Option<Instant>,
+    last_emit_direction: Option<AttachScrollDirection>,
     interval: Duration,
 }
 
@@ -167,6 +170,7 @@ impl AttachWheelScrollCoalescer {
         Self {
             pending: None,
             last_emit_at: None,
+            last_emit_direction: None,
             interval,
         }
     }
@@ -181,7 +185,30 @@ impl AttachWheelScrollCoalescer {
         modifiers: u8,
         now: Instant,
     ) -> AttachScrollMessages {
+        let trace_enabled = crate::render_prof::enabled();
+        let seq = trace_enabled
+            .then(crate::render_prof::next_trace_seq)
+            .unwrap_or(0);
+        let pending_before = trace_enabled
+            .then(|| {
+                self.pending.as_ref().map(|pending| {
+                    format!(
+                        "{}:{}",
+                        attach_scroll_direction_name(pending.direction),
+                        pending.lines
+                    )
+                })
+            })
+            .flatten();
+        let last_emit_age_ms = trace_enabled
+            .then(|| {
+                self.last_emit_at
+                    .map(|last_emit_at| now.duration_since(last_emit_at).as_millis())
+            })
+            .flatten();
+        crate::render_prof::event("client.attach_scroll.raw");
         let AttachScrollSource::Wheel = source else {
+            crate::render_prof::event("client.attach_scroll.fallback_non_wheel");
             let message = ClientMessage::AttachScroll {
                 source,
                 direction,
@@ -191,8 +218,34 @@ impl AttachWheelScrollCoalescer {
                 modifiers,
             };
             return match self.flush(now) {
-                Some(pending) => AttachScrollMessages::Two(pending, message),
-                None => AttachScrollMessages::One(message),
+                Some(pending) => {
+                    trace_client_attach_scroll_push(
+                        seq,
+                        direction,
+                        lines,
+                        column,
+                        row,
+                        pending_before.clone(),
+                        "flush_changed_target",
+                        Some((&pending, &message)),
+                        last_emit_age_ms,
+                    );
+                    AttachScrollMessages::Two(pending, message)
+                }
+                None => {
+                    trace_client_attach_scroll_push(
+                        seq,
+                        direction,
+                        lines,
+                        column,
+                        row,
+                        pending_before.clone(),
+                        "emit",
+                        Some((&message, &message)),
+                        last_emit_age_ms,
+                    );
+                    AttachScrollMessages::One(message)
+                }
             };
         };
 
@@ -207,24 +260,84 @@ impl AttachWheelScrollCoalescer {
         if let Some(pending) = &mut self.pending {
             if pending.can_merge(&incoming) {
                 pending.add_lines(incoming.lines);
+                crate::render_prof::event("client.attach_scroll.coalesced");
+                trace_client_attach_scroll_push(
+                    seq,
+                    direction,
+                    lines,
+                    column,
+                    row,
+                    pending_before.clone(),
+                    "coalesced",
+                    None,
+                    last_emit_age_ms,
+                );
                 return AttachScrollMessages::Empty;
             }
 
+            crate::render_prof::event("client.attach_scroll.flush_changed_target");
+            let action = if pending.direction != direction {
+                "cancel_reverse"
+            } else {
+                "flush_changed_target"
+            };
             let pending = self
                 .flush(now)
                 .expect("pending wheel scroll exists before changed-target flush");
             self.last_emit_at = Some(now);
-            return AttachScrollMessages::Two(pending, incoming.into_message());
+            self.last_emit_direction = Some(incoming.direction);
+            let incoming_message = incoming.into_message();
+            trace_client_attach_scroll_push(
+                seq,
+                direction,
+                lines,
+                column,
+                row,
+                pending_before.clone(),
+                action,
+                Some((&pending, &incoming_message)),
+                last_emit_age_ms,
+            );
+            return AttachScrollMessages::Two(pending, incoming_message);
         }
 
         if self
-            .last_emit_at
-            .is_none_or(|last_emit_at| now.duration_since(last_emit_at) >= self.interval)
+            .last_emit_direction
+            .is_some_and(|last_direction| last_direction != direction)
+            || self
+                .last_emit_at
+                .is_none_or(|last_emit_at| now.duration_since(last_emit_at) >= self.interval)
         {
             self.last_emit_at = Some(now);
-            AttachScrollMessages::One(incoming.into_message())
+            self.last_emit_direction = Some(direction);
+            crate::render_prof::event("client.attach_scroll.emitted_immediate");
+            let message = incoming.into_message();
+            trace_client_attach_scroll_push(
+                seq,
+                direction,
+                lines,
+                column,
+                row,
+                pending_before.clone(),
+                "emit",
+                Some((&message, &message)),
+                last_emit_age_ms,
+            );
+            AttachScrollMessages::One(message)
         } else {
             self.pending = Some(incoming);
+            crate::render_prof::event("client.attach_scroll.deferred");
+            trace_client_attach_scroll_push(
+                seq,
+                direction,
+                lines,
+                column,
+                row,
+                pending_before.clone(),
+                "deferred",
+                None,
+                last_emit_age_ms,
+            );
             AttachScrollMessages::Empty
         }
     }
@@ -234,12 +347,15 @@ impl AttachWheelScrollCoalescer {
         if now.duration_since(last_emit_at) < self.interval {
             return None;
         }
+        crate::render_prof::event("client.attach_scroll.flush_due");
         self.flush(now)
     }
 
     fn flush(&mut self, now: Instant) -> Option<ClientMessage> {
         let pending = self.pending.take()?;
         self.last_emit_at = Some(now);
+        self.last_emit_direction = Some(pending.direction);
+        crate::render_prof::event("client.attach_scroll.flush");
         Some(pending.into_message())
     }
 
@@ -251,6 +367,90 @@ impl AttachWheelScrollCoalescer {
                 .saturating_sub(now.duration_since(last_emit_at)),
         )
     }
+}
+
+fn attach_scroll_direction_name(direction: AttachScrollDirection) -> &'static str {
+    match direction {
+        AttachScrollDirection::Up => "up",
+        AttachScrollDirection::Down => "down",
+    }
+}
+
+fn attach_scroll_message_fields(message: &ClientMessage) -> Option<(&'static str, u16)> {
+    match message {
+        ClientMessage::AttachScroll {
+            direction, lines, ..
+        } => Some((attach_scroll_direction_name(*direction), *lines)),
+        _ => None,
+    }
+}
+
+fn trace_client_attach_scroll_push(
+    seq: u64,
+    direction: AttachScrollDirection,
+    lines: u16,
+    column: Option<u16>,
+    row: Option<u16>,
+    pending_before: Option<String>,
+    action: &'static str,
+    emitted: Option<(&ClientMessage, &ClientMessage)>,
+    last_emit_age_ms: Option<u128>,
+) {
+    if !crate::render_prof::enabled() {
+        return;
+    }
+    let emitted_first = emitted.and_then(|(first, _)| attach_scroll_message_fields(first));
+    let emitted_second = emitted.and_then(|(_, second)| attach_scroll_message_fields(second));
+    crate::render_prof::trace_event(
+        "client.attach_scroll.push",
+        &[
+            ("seq", seq.to_string()),
+            (
+                "direction",
+                crate::render_prof::trace_string(attach_scroll_direction_name(direction)),
+            ),
+            ("lines", lines.to_string()),
+            ("col", crate::render_prof::trace_opt(column)),
+            ("row", crate::render_prof::trace_opt(row)),
+            (
+                "pending_before",
+                pending_before
+                    .map(crate::render_prof::trace_string)
+                    .unwrap_or_else(|| "null".to_owned()),
+            ),
+            ("action", crate::render_prof::trace_string(action)),
+            (
+                "emitted_direction",
+                emitted_second
+                    .map(|(dir, _)| crate::render_prof::trace_string(dir))
+                    .unwrap_or_else(|| "null".to_owned()),
+            ),
+            (
+                "emitted_lines",
+                emitted_second
+                    .map(|(_, lines)| lines.to_string())
+                    .unwrap_or_else(|| "null".to_owned()),
+            ),
+            (
+                "flushed_direction",
+                emitted_first
+                    .map(|(dir, _)| crate::render_prof::trace_string(dir))
+                    .unwrap_or_else(|| "null".to_owned()),
+            ),
+            (
+                "flushed_lines",
+                emitted_first
+                    .map(|(_, lines)| lines.to_string())
+                    .unwrap_or_else(|| "null".to_owned()),
+            ),
+            (
+                "last_emit_age_ms",
+                last_emit_age_ms
+                    .map(|age| age.to_string())
+                    .unwrap_or_else(|| "null".to_owned()),
+            ),
+        ],
+    );
 }
 
 #[derive(Debug, Default)]
@@ -337,11 +537,19 @@ fn attach_scroll_action(
     viewport_rows: u16,
     mouse_scroll_lines: usize,
 ) -> Option<AttachInputAction> {
+    let started = crate::render_prof::timer();
     if let Some(action) = direct_attach_wheel_scroll_action(data, mouse_scroll_lines) {
+        crate::render_prof::event("client.attach_input.fast_path_hit");
+        crate::render_prof::duration_since("client.attach_input.fast_path", started);
         return Some(action);
     }
 
-    attach_scroll_action_with_generic_parser(data, viewport_rows, mouse_scroll_lines)
+    crate::render_prof::event("client.attach_input.fast_path_miss");
+    let generic_started = crate::render_prof::timer();
+    let action = attach_scroll_action_with_generic_parser(data, viewport_rows, mouse_scroll_lines);
+    crate::render_prof::duration_since("client.attach_input.generic_parse", generic_started);
+    crate::render_prof::duration_since("client.attach_input.total", started);
+    action
 }
 
 fn direct_attach_wheel_scroll_action(
@@ -550,6 +758,98 @@ fn attach_scroll_action_with_parser_probe(
 
     probe.generic_parse_calls += 1;
     attach_scroll_action_with_generic_parser(data, viewport_rows, mouse_scroll_lines)
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct DirectAttachWheelWriteStats {
+    pub(crate) emitted_messages: usize,
+    pub(crate) emitted_scroll_lines: usize,
+}
+
+#[cfg(test)]
+pub(crate) fn write_direct_attach_wheel_chunks_for_test(
+    stream: &mut UnixStream,
+    chunks: &[Vec<u8>],
+    viewport_rows: u16,
+    mouse_scroll_lines: usize,
+    interval: Duration,
+    start: Instant,
+) -> io::Result<DirectAttachWheelWriteStats> {
+    let mut coalescer = AttachWheelScrollCoalescer::new(interval);
+    let mut stats = DirectAttachWheelWriteStats::default();
+    let mut now = start;
+    for chunk in chunks {
+        let Some(action) = attach_scroll_action(chunk, viewport_rows, mouse_scroll_lines) else {
+            continue;
+        };
+        write_attach_action_messages_for_test(stream, &mut coalescer, action, now, &mut stats)?;
+        now += Duration::from_millis(16);
+        if let Some(msg) = coalescer.flush_due(now) {
+            write_attach_scroll_for_test(stream, &msg, &mut stats)?;
+        }
+    }
+    if let Some(msg) = coalescer.flush(now + interval) {
+        write_attach_scroll_for_test(stream, &msg, &mut stats)?;
+    }
+    Ok(stats)
+}
+
+#[cfg(test)]
+fn write_attach_action_messages_for_test(
+    stream: &mut UnixStream,
+    coalescer: &mut AttachWheelScrollCoalescer,
+    action: AttachInputAction,
+    now: Instant,
+    stats: &mut DirectAttachWheelWriteStats,
+) -> io::Result<()> {
+    match action {
+        AttachInputAction::Scroll {
+            source,
+            direction,
+            lines,
+            column,
+            row,
+            modifiers,
+        } => {
+            for msg in coalescer.push_scroll(source, direction, lines, column, row, modifiers, now)
+            {
+                write_attach_scroll_for_test(stream, &msg, stats)?;
+            }
+        }
+        AttachInputAction::ScrollBatch(requests) => {
+            for request in requests {
+                for msg in coalescer.push_scroll(
+                    request.source,
+                    request.direction,
+                    request.lines,
+                    request.column,
+                    request.row,
+                    request.modifiers,
+                    now,
+                ) {
+                    write_attach_scroll_for_test(stream, &msg, stats)?;
+                }
+            }
+        }
+        AttachInputAction::Forward(_) | AttachInputAction::Detach | AttachInputAction::None => {}
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn write_attach_scroll_for_test(
+    stream: &mut UnixStream,
+    msg: &ClientMessage,
+    stats: &mut DirectAttachWheelWriteStats,
+) -> io::Result<()> {
+    let ClientMessage::AttachScroll { lines, .. } = msg else {
+        panic!("expected AttachScroll, got {msg:?}");
+    };
+    write_to_server(stream, msg)?;
+    stats.emitted_messages += 1;
+    stats.emitted_scroll_lines += usize::from(*lines);
+    Ok(())
 }
 
 impl ClientState {
@@ -1051,6 +1351,7 @@ async fn run_client_loop(
         mouse_scroll_lines,
         redraw_on_focus_gained,
         attach_wheel_scroll: AttachWheelScrollCoalescer::default(),
+        trace_frame_seq: 0,
     };
     debug!(?negotiated_encoding, "client render encoding active");
 
@@ -1103,6 +1404,8 @@ async fn run_client_loop(
 
     // Main event loop.
     while !should_quit.load(Ordering::Acquire) {
+        crate::render_prof::flush_if_due();
+
         if let Some(msg) = state.attach_wheel_scroll.flush_due(Instant::now()) {
             if let Err(e) = write_to_server(&mut write_stream, &msg) {
                 return Err(ClientError::ConnectionLost(e));
@@ -1184,6 +1487,7 @@ async fn run_client_loop(
                                 &mut write_stream,
                                 Instant::now(),
                             )?;
+                            crate::render_prof::flush_now();
                             return Ok(());
                         }
                         AttachInputAction::None => continue,
@@ -1257,9 +1561,23 @@ async fn run_client_loop(
                     } else {
                         &[]
                     };
+                    crate::render_prof::counter(
+                        "client.output.frame_bytes",
+                        encoded.bytes.len() as u64,
+                    );
+                    let output_started = crate::render_prof::timer();
                     let _ =
                         write_encoded_frame_with_graphics(&mut stdout, &encoded.bytes, graphics);
                     let _ = stdout.flush();
+                    let write_us = output_started.map(|started| started.elapsed().as_micros());
+                    crate::render_prof::duration_since("client.output.write_flush", output_started);
+                    state.trace_frame_seq = state.trace_frame_seq.saturating_add(1);
+                    trace_client_frame(
+                        "frame",
+                        state.trace_frame_seq,
+                        encoded.bytes.len(),
+                        write_us,
+                    );
                     state.blit_encoder.commit(frame_data, encoded);
                 }
                 ServerMessage::Terminal(frame) => {
@@ -1267,15 +1585,33 @@ async fn run_client_loop(
                         record_received_kitty_graphics(&frame.bytes);
                     }
                     let mut stdout = io::stdout();
+                    crate::render_prof::counter(
+                        "client.output.terminal_bytes",
+                        frame.bytes.len() as u64,
+                    );
+                    let output_started = crate::render_prof::timer();
                     let _ = stdout.write_all(&frame.bytes);
                     let _ = stdout.flush();
+                    let write_us = output_started.map(|started| started.elapsed().as_micros());
+                    crate::render_prof::duration_since("client.output.write_flush", output_started);
+                    state.trace_frame_seq = state.trace_frame_seq.saturating_add(1);
+                    trace_client_frame("terminal", frame.seq, frame.bytes.len(), write_us);
                 }
                 ServerMessage::Graphics { bytes } => {
                     if state.kitty_graphics_enabled {
                         record_received_kitty_graphics(&bytes);
                         let mut stdout = io::stdout();
+                        crate::render_prof::counter(
+                            "client.output.graphics_bytes",
+                            bytes.len() as u64,
+                        );
+                        let output_started = crate::render_prof::timer();
                         let _ = stdout.write_all(&bytes);
                         let _ = stdout.flush();
+                        crate::render_prof::duration_since(
+                            "client.output.write_flush",
+                            output_started,
+                        );
                     }
                 }
                 ServerMessage::ServerShutdown { reason } => {
@@ -1324,6 +1660,7 @@ async fn run_client_loop(
         Instant::now(),
     )?;
     let _ = io::stdout().flush();
+    crate::render_prof::flush_now();
 
     Ok(())
 }
@@ -1389,7 +1726,81 @@ fn server_reader_thread(
 
 /// Writes a message to the server stream (blocking).
 fn write_to_server(stream: &mut UnixStream, msg: &ClientMessage) -> io::Result<()> {
-    protocol::write_message(stream, msg).map_err(|e| io::Error::other(e.to_string()))
+    let attach_scroll_fields = match msg {
+        ClientMessage::AttachScroll {
+            direction, lines, ..
+        } => Some((*direction, *lines)),
+        _ => None,
+    };
+    let encoded_bytes = attach_scroll_fields.and_then(|_| {
+        crate::render_prof::enabled().then(|| {
+            bincode::serde::encode_to_vec(msg, bincode::config::standard())
+                .map(|payload| payload.len().saturating_add(std::mem::size_of::<u32>()))
+                .ok()
+        })?
+    });
+    if matches!(msg, ClientMessage::AttachScroll { .. }) {
+        crate::render_prof::event("client.write.attach_scroll");
+    }
+    let started = crate::render_prof::timer();
+    let result = protocol::write_message(stream, msg).map_err(|e| io::Error::other(e.to_string()));
+    let write_us = started.map(|started| started.elapsed().as_micros());
+    crate::render_prof::duration_since("client.write_to_server", started);
+    if let Some((direction, lines)) = attach_scroll_fields {
+        trace_client_write_attach_scroll(direction, lines, encoded_bytes, write_us, result.is_ok());
+    }
+    result
+}
+
+fn trace_client_write_attach_scroll(
+    direction: AttachScrollDirection,
+    lines: u16,
+    bytes: Option<usize>,
+    write_us: Option<u128>,
+    ok: bool,
+) {
+    if !crate::render_prof::enabled() {
+        return;
+    }
+    crate::render_prof::trace_event(
+        "client.write.attach_scroll",
+        &[
+            (
+                "dir",
+                crate::render_prof::trace_string(attach_scroll_direction_name(direction)),
+            ),
+            ("lines", lines.to_string()),
+            ("bytes", crate::render_prof::trace_opt(bytes)),
+            (
+                "write_us",
+                write_us
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "null".to_owned()),
+            ),
+            ("ok", ok.to_string()),
+        ],
+    );
+}
+
+fn trace_client_frame(kind: &'static str, frame_seq: u64, bytes: usize, write_us: Option<u128>) {
+    if !crate::render_prof::enabled() {
+        return;
+    }
+    crate::render_prof::trace_event(
+        "client.frame.recv_write",
+        &[
+            ("kind", crate::render_prof::trace_string(kind)),
+            ("frame_seq", frame_seq.to_string()),
+            ("bytes", bytes.to_string()),
+            ("age_ms", "null".to_owned()),
+            (
+                "write_us",
+                write_us
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "null".to_owned()),
+            ),
+        ],
+    );
 }
 
 fn detach_from_server_after_flushing_attach_scroll(
@@ -1901,16 +2312,15 @@ mod tests {
         .is_empty());
 
         for (direction, column, row, modifiers, pending_lines, incoming_lines) in [
-            (AttachScrollDirection::Down, Some(4), Some(8), 0, 2, 3),
-            (AttachScrollDirection::Down, Some(5), Some(8), 0, 4, 5),
-            (AttachScrollDirection::Down, Some(5), Some(9), 0, 6, 7),
+            (AttachScrollDirection::Up, Some(5), Some(8), 0, 2, 3),
+            (AttachScrollDirection::Up, Some(5), Some(9), 0, 4, 5),
             (
-                AttachScrollDirection::Down,
+                AttachScrollDirection::Up,
                 Some(5),
                 Some(9),
                 KeyModifiers::CONTROL.bits(),
-                8,
-                9,
+                6,
+                7,
             ),
         ] {
             let messages = push_wheel_at(
@@ -1938,6 +2348,150 @@ mod tests {
             )
             .is_empty());
         }
+    }
+
+    #[test]
+    fn attach_wheel_scroll_coalescer_flushes_pending_on_direction_reversal() {
+        let mut coalescer = AttachWheelScrollCoalescer::new(Duration::from_millis(16));
+        let now = Instant::now();
+
+        assert_eq!(
+            push_wheel(&mut coalescer, AttachScrollDirection::Up, 2, Some(8), now).len(),
+            1
+        );
+        assert!(push_wheel(
+            &mut coalescer,
+            AttachScrollDirection::Up,
+            5,
+            Some(8),
+            now + Duration::from_millis(1),
+        )
+        .is_empty());
+
+        let reversed = push_wheel(
+            &mut coalescer,
+            AttachScrollDirection::Down,
+            3,
+            Some(8),
+            now + Duration::from_millis(2),
+        );
+        assert_eq!(reversed.len(), 2);
+        assert_eq!(
+            attach_scroll_direction(&reversed[0]),
+            AttachScrollDirection::Up
+        );
+        assert_eq!(attach_scroll_lines(&reversed[0]), 5);
+        assert_eq!(
+            attach_scroll_direction(&reversed[1]),
+            AttachScrollDirection::Down
+        );
+        assert_eq!(attach_scroll_lines(&reversed[1]), 3);
+        assert!(
+            coalescer
+                .flush_due(now + Duration::from_millis(32))
+                .is_none(),
+            "reversal must synchronously flush pending prior-direction wheel debt"
+        );
+    }
+
+    #[test]
+    fn attach_wheel_scroll_coalescer_flushes_double_inertial_reversal_debt() {
+        let mut coalescer = AttachWheelScrollCoalescer::new(Duration::from_millis(16));
+        let now = Instant::now();
+
+        assert_eq!(
+            push_wheel(&mut coalescer, AttachScrollDirection::Up, 1, Some(8), now).len(),
+            1
+        );
+        assert!(push_wheel(
+            &mut coalescer,
+            AttachScrollDirection::Up,
+            4,
+            Some(8),
+            now + Duration::from_millis(1),
+        )
+        .is_empty());
+
+        let down = push_wheel(
+            &mut coalescer,
+            AttachScrollDirection::Down,
+            2,
+            Some(8),
+            now + Duration::from_millis(2),
+        );
+        assert_eq!(down.len(), 2);
+        assert_eq!(attach_scroll_direction(&down[0]), AttachScrollDirection::Up);
+        assert_eq!(attach_scroll_lines(&down[0]), 4);
+        assert_eq!(
+            attach_scroll_direction(&down[1]),
+            AttachScrollDirection::Down
+        );
+        assert_eq!(attach_scroll_lines(&down[1]), 2);
+        assert!(push_wheel(
+            &mut coalescer,
+            AttachScrollDirection::Down,
+            6,
+            Some(8),
+            now + Duration::from_millis(3),
+        )
+        .is_empty());
+
+        let up = push_wheel(
+            &mut coalescer,
+            AttachScrollDirection::Up,
+            3,
+            Some(8),
+            now + Duration::from_millis(4),
+        );
+        assert_eq!(up.len(), 2);
+        assert_eq!(attach_scroll_direction(&up[0]), AttachScrollDirection::Down);
+        assert_eq!(attach_scroll_lines(&up[0]), 6);
+        assert_eq!(attach_scroll_direction(&up[1]), AttachScrollDirection::Up);
+        assert_eq!(attach_scroll_lines(&up[1]), 3);
+        assert!(coalescer
+            .flush_due(now + Duration::from_millis(32))
+            .is_none());
+    }
+
+    #[test]
+    fn attach_wheel_scroll_coalescer_emits_release_separated_reversal_immediately() {
+        let mut coalescer = AttachWheelScrollCoalescer::new(Duration::from_millis(16));
+        let now = Instant::now();
+
+        assert_eq!(
+            push_wheel(&mut coalescer, AttachScrollDirection::Down, 1, Some(8), now).len(),
+            1
+        );
+        assert!(push_wheel(
+            &mut coalescer,
+            AttachScrollDirection::Down,
+            4,
+            Some(8),
+            now + Duration::from_millis(1),
+        )
+        .is_empty());
+
+        let stale_bottom_debt = coalescer
+            .flush_due(now + Duration::from_millis(17))
+            .expect("stale same-direction boundary debt flushes after release");
+        assert_eq!(
+            attach_scroll_direction(&stale_bottom_debt),
+            AttachScrollDirection::Down
+        );
+
+        let reversed = push_wheel(
+            &mut coalescer,
+            AttachScrollDirection::Up,
+            2,
+            Some(8),
+            now + Duration::from_millis(18),
+        );
+        assert_eq!(reversed.len(), 1);
+        assert_eq!(
+            attach_scroll_direction(&reversed[0]),
+            AttachScrollDirection::Up
+        );
+        assert_eq!(attach_scroll_lines(&reversed[0]), 2);
     }
 
     #[test]

@@ -59,7 +59,9 @@ impl ClientRenderState {
                     crate::render_prof::event("prepare_frame.ansi.skip_current");
                     return None;
                 }
+                let encode_started = crate::render_prof::timer();
                 let mut encoded = blit_encoder.encode(frame, false);
+                crate::render_prof::duration_since("prepare_frame.ansi.encode", encode_started);
                 crate::render_prof::event("prepare_frame.ansi.changed");
                 crate::render_prof::counter("prepare_frame.ansi.bytes", encoded.bytes.len() as u64);
                 if encoded.full {
@@ -261,24 +263,44 @@ pub(crate) fn render_virtual_with_runtime_registry(
     resize_panes: bool,
     cell_size: crate::kitty_graphics::HostCellSize,
 ) -> (ratatui::buffer::Buffer, Option<CursorState>) {
+    crate::render_prof::event("full_render.targets");
+    crate::render_prof::counter(
+        "full_render.output_cells",
+        u64::from(area.width) * u64::from(area.height),
+    );
+
+    let compute_started = crate::render_prof::timer();
     if resize_panes {
         crate::ui::compute_view_with_cell_size(app_state, terminal_runtimes, area, cell_size);
     } else {
         crate::ui::compute_view_without_resizing_panes(app_state, terminal_runtimes, area);
     }
+    crate::render_prof::duration_since("full_render.compute_view", compute_started);
 
+    let backend_started = crate::render_prof::timer();
     let backend = CursorTrackingBackend::new(area.width, area.height);
-    let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend::new should never fail");
+    crate::render_prof::duration_since("full_render.backend_new", backend_started);
 
+    let terminal_started = crate::render_prof::timer();
+    let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend::new should never fail");
+    crate::render_prof::duration_since("full_render.ratatui_terminal_new", terminal_started);
+
+    let draw_started = crate::render_prof::timer();
     terminal
         .draw(|frame| {
             crate::ui::render_with_runtime_registry(app_state, terminal_runtimes, frame);
         })
         .expect("render to TestBackend should never fail");
+    crate::render_prof::duration_since("full_render.ratatui_draw_total", draw_started);
 
+    let clone_started = crate::render_prof::timer();
     let buffer = terminal.backend().buffer().clone();
+    crate::render_prof::duration_since("full_render.buffer_clone", clone_started);
+
+    let cursor_started = crate::render_prof::timer();
     let cursor = focused_terminal_cursor(app_state, terminal_runtimes)
         .or_else(|| terminal.backend().rendered_cursor());
+    crate::render_prof::duration_since("full_render.focused_cursor", cursor_started);
 
     (buffer, cursor)
 }
@@ -288,16 +310,33 @@ pub(crate) fn render_terminal_virtual(
     runtime: &crate::terminal::TerminalRuntime,
     area: Rect,
 ) -> (ratatui::buffer::Buffer, Option<CursorState>) {
-    let backend = CursorTrackingBackend::new(area.width, area.height);
-    let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend::new should never fail");
+    crate::render_prof::event("full_render.targets");
+    crate::render_prof::counter(
+        "full_render.output_cells",
+        u64::from(area.width) * u64::from(area.height),
+    );
 
+    let backend_started = crate::render_prof::timer();
+    let backend = CursorTrackingBackend::new(area.width, area.height);
+    crate::render_prof::duration_since("full_render.backend_new", backend_started);
+
+    let terminal_started = crate::render_prof::timer();
+    let mut terminal = ratatui::Terminal::new(backend).expect("TestBackend::new should never fail");
+    crate::render_prof::duration_since("full_render.ratatui_terminal_new", terminal_started);
+
+    let draw_started = crate::render_prof::timer();
     terminal
         .draw(|frame| {
             runtime.render(frame, area, true);
         })
         .expect("render to TestBackend should never fail");
+    crate::render_prof::duration_since("full_render.ratatui_draw_total", draw_started);
 
+    let clone_started = crate::render_prof::timer();
     let buffer = terminal.backend().buffer().clone();
+    crate::render_prof::duration_since("full_render.buffer_clone", clone_started);
+
+    let cursor_started = crate::render_prof::timer();
     let cursor = runtime
         .cursor_state(area, true)
         .map(|cursor| CursorState {
@@ -307,6 +346,7 @@ pub(crate) fn render_terminal_virtual(
             shape: cursor.shape,
         })
         .or_else(|| terminal.backend().rendered_cursor());
+    crate::render_prof::duration_since("full_render.focused_cursor", cursor_started);
 
     (buffer, cursor)
 }

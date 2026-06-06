@@ -96,8 +96,6 @@ pub(crate) enum ServerEvent {
     ClientDetach { client_id: u64 },
     /// A client connection was lost.
     ClientDisconnected { client_id: u64 },
-    /// A client writer drained its render slot and can accept another render.
-    ClientWriterDrained { client_id: u64 },
     /// Ctrl+C or external shutdown signal received.
     QuitSignal,
 }
@@ -287,10 +285,11 @@ fn client_writer_loop(
     client_id: u64,
     control_rx: std::sync::mpsc::Receiver<Vec<u8>>,
     render_rx: std::sync::mpsc::Receiver<Vec<u8>>,
-    server_event_tx: mpsc::Sender<ServerEvent>,
+    _server_event_tx: mpsc::Sender<ServerEvent>,
 ) {
     let mut control_closed = false;
     let mut render_closed = false;
+    let mut writer_frame_seq = 0_u64;
 
     loop {
         match control_rx.try_recv() {
@@ -306,11 +305,19 @@ fn client_writer_loop(
 
         match render_rx.try_recv() {
             Ok(data) => {
-                let _ =
-                    server_event_tx.blocking_send(ServerEvent::ClientWriterDrained { client_id });
+                crate::render_prof::event("server.client_writer.render_recv");
+                crate::render_prof::counter("server.client_writer.render_bytes", data.len() as u64);
+                writer_frame_seq = writer_frame_seq.saturating_add(1);
+                let write_started = crate::render_prof::timer();
                 if !write_framed_bytes(&mut stream, &data) {
                     break;
                 }
+                let flush_us = write_started.map(|started| started.elapsed().as_micros());
+                crate::render_prof::duration_since(
+                    "server.client_writer.render_write_flush",
+                    write_started,
+                );
+                trace_writer_frame(client_id, writer_frame_seq, data.len(), flush_us);
                 continue;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -324,11 +331,22 @@ fn client_writer_loop(
         if control_closed {
             match render_rx.recv_timeout(Duration::from_millis(5)) {
                 Ok(data) => {
-                    let _ = server_event_tx
-                        .blocking_send(ServerEvent::ClientWriterDrained { client_id });
+                    crate::render_prof::event("server.client_writer.render_recv");
+                    crate::render_prof::counter(
+                        "server.client_writer.render_bytes",
+                        data.len() as u64,
+                    );
+                    writer_frame_seq = writer_frame_seq.saturating_add(1);
+                    let write_started = crate::render_prof::timer();
                     if !write_framed_bytes(&mut stream, &data) {
                         break;
                     }
+                    let flush_us = write_started.map(|started| started.elapsed().as_micros());
+                    crate::render_prof::duration_since(
+                        "server.client_writer.render_write_flush",
+                        write_started,
+                    );
+                    trace_writer_frame(client_id, writer_frame_seq, data.len(), flush_us);
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => render_closed = true,
@@ -347,6 +365,29 @@ fn client_writer_loop(
         }
     }
     debug!("client writer thread exiting");
+}
+
+fn trace_writer_frame(client_id: u64, writer_frame_seq: u64, bytes: usize, flush_us: Option<u128>) {
+    if !crate::render_prof::enabled() {
+        return;
+    }
+    crate::render_prof::trace_event(
+        "writer.frame",
+        &[
+            ("client_id", client_id.to_string()),
+            ("frame_seq", writer_frame_seq.to_string()),
+            ("render_seq", "null".to_owned()),
+            ("bytes", bytes.to_string()),
+            ("queue_depth", "0".to_owned()),
+            ("age_ms", "null".to_owned()),
+            (
+                "flush_us",
+                flush_us
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "null".to_owned()),
+            ),
+        ],
+    );
 }
 
 fn write_framed_bytes(stream: &mut UnixStream, data: &[u8]) -> bool {
